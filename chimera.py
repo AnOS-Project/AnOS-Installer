@@ -8,14 +8,14 @@ import time
 import socket
 import shlex
 import glob
+import json
 
 # --- Configuration & Constants ---
 COLORS = {
     'HEADER': '\033[95m', 'BLUE': '\033[94m', 'GREEN': '\033[92m',
     'WARN': '\033[93m', 'FAIL': '\033[91m', 'ENDC': '\033[0m', 'BOLD': '\033[1m'
 }
-MOUNT_POINT = "/mnt/chimera_target"
-DEBIAN_RELEASE = "trixie" # Stable
+MOUNT_POINT = "/mnt/anos_target"
 DEBUG_MODE = False
 
 # --- Utility Functions ---
@@ -27,7 +27,7 @@ def log(msg, level="info"):
     elif level == "warn": icon, color = "[?]", COLORS['WARN']
     elif level == "HEADER": icon, color = "[#]", COLORS['HEADER']
     elif level == "DEBUG": icon, color = "[D]", COLORS['WARN']
-    
+
     print(f"{color}{icon} {msg}{COLORS['ENDC']}")
 
 def run_cmd(cmd, shell=False, check=True, chroot=False, ignore_error=False, env=None, stream=False):
@@ -36,13 +36,13 @@ def run_cmd(cmd, shell=False, check=True, chroot=False, ignore_error=False, env=
     if chroot:
         if isinstance(cmd, list): cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
         else: cmd_str = cmd
-        
+
         if shutil.which("arch-chroot"):
             cmd = ["arch-chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
         else:
             cmd = ["chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
         shell = False
-    
+
     if DEBUG_MODE:
         log(f"CMD: {cmd}", "DEBUG")
 
@@ -55,14 +55,16 @@ def run_cmd(cmd, shell=False, check=True, chroot=False, ignore_error=False, env=
     except subprocess.CalledProcessError as e:
         if not ignore_error:
             log(f"Command Failed: {cmd}", "error")
-            if e.stderr:
+            if hasattr(e, 'stderr') and e.stderr:
                 print(f"{COLORS['FAIL']}STDERR: {e.stderr.decode().strip()}{COLORS['ENDC']}")
             elif show_output:
                 print(f"{COLORS['FAIL']}(Command failed, output above){COLORS['ENDC']}")
-            if check: raise e 
+            if check and not ignore_error:
+                raise e
         return False
 
 def check_connection():
+    """Kiểm tra kết nối mạng (BƯỚC 1 - Treemap)"""
     try:
         socket.create_connection(("1.1.1.1", 53), timeout=3)
         return True
@@ -75,26 +77,44 @@ def get_blk_value(device, field):
     except (subprocess.CalledProcessError, FileNotFoundError):
         return ""
 
+def get_ram_gb():
+    """Lấy dung lượng RAM để tính Swap = RAM / 2"""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if 'MemTotal' in line:
+                    return max(1, int(line.split()[1]) // 1048576)
+    except Exception:
+        pass
+    return 4  # Mặc định nếu không đọc được là 4GB
+
+def detect_nvidia():
+    """Nhận diện Card NVIDIA"""
+    try:
+        out = subprocess.check_output(["lspci"]).decode().lower()
+        return "nvidia" in out and ("vga" in out or "3d" in out)
+    except Exception:
+        return False
+
 # --- Main Installer Class ---
-class ChimeraInstaller:
+class AnOSInstaller:
     def __init__(self, args):
         self.args = args
         self.uefi = os.path.exists("/sys/firmware/efi")
         self.target_os = args.target.lower()
         self.disk = args.disk if args.disk else self._detect_disk(args.rootfs)
-        
+        self.is_online = check_connection()
+        self.has_nvidia = False
+
         if self.args.user and not self.args.passwd:
             sys.exit(f"{COLORS['FAIL']}Error: --user requires --passwd{COLORS['ENDC']}")
-
-        if self.target_os == "arch" and self.args.online and not shutil.which("pacstrap"):
-            sys.exit(f"{COLORS['FAIL']}Error: 'pacstrap' not found. Install 'arch-install-scripts'.{COLORS['ENDC']}")
-        if self.target_os == "debian" and self.args.online and not shutil.which("debootstrap"):
-            sys.exit(f"{COLORS['FAIL']}Error: 'debootstrap' not found. Please install it.{COLORS['ENDC']}")
 
     def _detect_disk(self, partition):
         try:
             if not partition: return None
-            parent = subprocess.check_output(["lsblk", "-no", "pkname", partition], stderr=subprocess.PIPE).decode().strip()
+            parent = subprocess.check_output(
+                ["lsblk", "-no", "pkname", partition], stderr=subprocess.PIPE
+            ).decode().strip()
             return f"/dev/{parent}"
         except Exception:
             return None
@@ -103,19 +123,17 @@ class ChimeraInstaller:
         try:
             self.welcome()
             self.safety_check()
-            self.ensure_network_logic()
             self.partition_handler()
             self.install_base()
-            if self.target_os not in ["arch", "debian"] or not self.args.online: 
-                if not shutil.which("arch-chroot"):
-                    self.setup_chroot_mounts()
+            if not shutil.which("arch-chroot"):
+                self.setup_chroot_mounts()
             self.configure_system()
             self.setup_users()
-            self.install_bal_extras()
-            self.run_custom_scripts()
+            self.install_packages()
             self.install_bootloader()
+            self.run_custom_scripts()
             self.finalize()
-            log("Installation Successfully Completed.", "success")
+            log("AnOS Installation Successfully Completed.", "success")
         except Exception as e:
             log(f"Critical Failure: {e}", "error")
             import traceback
@@ -126,65 +144,64 @@ class ChimeraInstaller:
 
     def welcome(self):
         os.system("clear")
-        log(f"Chimera Installer - {self.target_os.upper()} Edition", "HEADER")
+        log(f"AnOS Installer - The Simple & Powerful OS", "HEADER")
+        log(f"Network Status: {'Online' if self.is_online else 'Offline (Fallback Mode)'}", "info")
+        log(f"Profiles Selected: {self.args.profiles}", "info")
         log(f"Target Disk: {self.disk} | Boot Mode: {'UEFI' if self.uefi else 'BIOS'}", "info")
-        
-        if DEBUG_MODE:
-            log("Debug Mode: ON (Verbose output enabled)", "DEBUG")
-            log("Current Disk Layout:", "DEBUG")
-            subprocess.run(["lsblk"])
-            print("-" * 40)
 
-        if self.args.user:
-            log(f"User Setup: {self.args.user}", "info")
-        if self.args.passwd:
-            log("Password set for Root (and User).", "info")
-        if self.args.timezone:
-            log(f"Timezone: {self.args.timezone}", "info")
-        
-        if (self.target_os in ["arch", "debian", "bal"] and not self.args.online) or self.target_os == "bal":
-            print(f"\n{COLORS['WARN']}WARNING: Offline/Clone Install Mode Active.{COLORS['ENDC']}")
-            time.sleep(1)
+        if self.args.disk:
+            log("Disk Mode: WIPE WHOLE DISK", "warn")
+        elif self.args.shrink_part:
+            log(f"Disk Mode: DUAL BOOT (Shrink {self.args.shrink_part} by {self.args.anos_size}GB)", "warn")
+        else:
+            log("Disk Mode: MANUAL PARTITIONING", "warn")
+
+        time.sleep(2)
 
     def safety_check(self):
         if self.args.i_am_very_stupid: return
 
         if self.args.disk:
-            print(f"\n{COLORS['FAIL']}!!!!!!!!!! WARNING: AUTOMATED DISK MODE !!!!!!!!!!{COLORS['ENDC']}")
-            print(f"{COLORS['FAIL']}THE ENTIRE DISK {self.args.disk} WILL BE WIPED.{COLORS['ENDC']}")
+            print(f"\n{COLORS['FAIL']}!!!!!!!!!! CẢNH BÁO ĐỎ !!!!!!!!!!{COLORS['ENDC']}")
+            print(f"{COLORS['FAIL']}TOÀN BỘ DỮ LIỆU TRÊN Ổ {self.args.disk} SẼ BỊ XÓA SẠCH VÀ FORMAT.{COLORS['ENDC']}")
+        elif self.args.shrink_part:
+            print(f"\n{COLORS['FAIL']}CẢNH BÁO: DUAL BOOT MODE{COLORS['ENDC']}")
+            print(f"Sẽ thu nhỏ phân vùng Windows {self.args.shrink_part}. Vui lòng đảm bảo đã tắt BitLocker/Fast Startup.")
         else:
-            print(f"\n{COLORS['FAIL']}WARNING: MANUAL MODE{COLORS['ENDC']}")
-            print(f"  - Root: {self.args.rootfs}")
+            print(f"\n{COLORS['FAIL']}CẢNH BÁO: MANUAL MODE{COLORS['ENDC']}")
 
-        if input(f"\nType 'YES' to proceed: ") != "YES":
-            sys.exit("Aborted.")
-
-    def ensure_network_logic(self):
-        if self.target_os == "gentoo" or self.args.online:
-            if not check_connection():
-                log("Network required. Trying nmtui...", "warn")
-                if shutil.which("nmtui"): subprocess.run(["nmtui"])
-                if not check_connection(): raise RuntimeError("No Internet Connection.")
+        if input(f"\nGõ 'YES' để tiếp tục: ") != "YES":
+            sys.exit("Đã hủy bỏ (Aborted).")
 
     def partition_handler(self):
         log("Preparing Partitions...", "info")
         run_cmd(["umount", "-R", MOUNT_POINT], check=False, ignore_error=True)
         run_cmd(["swapoff", "-a"], check=False, ignore_error=True)
-        
+
         if self.args.disk:
             self._auto_partition_disk()
+        elif self.args.shrink_part:
+            self._dual_boot_shrink()
 
+        # Format & Mount Root
         run_cmd(["mkfs.ext4", "-F", self.args.rootfs])
         os.makedirs(MOUNT_POINT, exist_ok=True)
         run_cmd(["mount", self.args.rootfs, MOUNT_POINT])
-        
+
+        # Format & Mount Boot (If not sharing Windows EFI)
         if self.args.boot:
             path = f"{MOUNT_POINT}/boot/efi" if self.uefi else f"{MOUNT_POINT}/boot"
             os.makedirs(path, exist_ok=True)
-            if self.uefi: run_cmd(["mkfs.vfat", "-F32", self.args.boot])
-            else: run_cmd(["mkfs.ext4", "-F", self.args.boot])
+            # Không format vfat nếu đang tái sử dụng EFI của Windows, chỉ mount
+            if self.args.shrink_part and self.uefi:
+                log(f"Tái sử dụng EFI Partition: {self.args.boot}", "info")
+            else:
+                if self.uefi: run_cmd(["mkfs.vfat", "-F32", self.args.boot])
+                else: run_cmd(["mkfs.ext4", "-F", self.args.boot])
+
             run_cmd(["mount", self.args.boot, path])
-        
+
+        # Setup Swap
         if self.args.swap:
             run_cmd(["mkswap", self.args.swap])
             run_cmd(["swapon", self.args.swap])
@@ -194,72 +211,90 @@ class ChimeraInstaller:
         label_type = "gpt" if self.uefi else "msdos"
         run_cmd(["wipefs", "--all", self.disk])
         run_cmd(["parted", "-s", self.disk, "mklabel", label_type])
-        
+
         boot_part_end = "513MiB"
         run_cmd(["parted", "-s", self.disk, "mkpart", "primary", "1MiB", boot_part_end])
         current_end = boot_part_end
-        
-        if self.args.swap:
-            size = self.args.swap.upper()
-            mult = 1024 if "G" in size else 1
-            mb_size = int(''.join(filter(str.isdigit, size))) * mult
-            swap_end = f"{513 + mb_size}MiB"
-            run_cmd(["parted", "-s", self.disk, "mkpart", "primary", current_end, swap_end])
-            current_end = swap_end
 
+        # Logic: Swap = RAM / 2
+        ram_gb = get_ram_gb()
+        swap_gb = max(1, ram_gb // 2)
+        swap_end = f"{513 + (swap_gb * 1024)}MiB"
+
+        log(f"Tạo Swap Partition: {swap_gb}GB", "info")
+        run_cmd(["parted", "-s", self.disk, "mkpart", "primary", current_end, swap_end])
+        current_end = swap_end
+
+        # Rootfs uses remaining 100%
         run_cmd(["parted", "-s", self.disk, "mkpart", "primary", current_end, "100%"])
-        
+
         prefix = f"{self.disk}p" if self.disk.startswith("/dev/nvme") or self.disk.startswith("/dev/mmc") else f"{self.disk}"
-        
+
         self.args.boot = f"{prefix}1"
-        if self.args.swap:
-            self.args.swap = f"{prefix}2"
-            self.args.rootfs = f"{prefix}3"
-        else:
-            self.args.rootfs = f"{prefix}2"
+        self.args.swap = f"{prefix}2"
+        self.args.rootfs = f"{prefix}3"
 
         if self.uefi: run_cmd(["parted", "-s", self.disk, "set", "1", "esp", "on"])
         else: run_cmd(["parted", "-s", self.disk, "set", "1", "boot", "on"])
-        
+
         run_cmd(["partprobe", self.disk])
         time.sleep(2)
-        log(f"Layout: Boot={self.args.boot}, Root={self.args.rootfs}", "success")
+        log(f"Layout Auto: Boot={self.args.boot}, Swap={self.args.swap}, Root={self.args.rootfs}", "success")
+
+    def _dual_boot_shrink(self):
+        """Logic Thu nhỏ ổ Windows và tạo không gian cho AnOS"""
+        log(f"Tiến hành Dual Boot Shrink trên {self.args.shrink_part}...", "warn")
+        disk = self._detect_disk(self.args.shrink_part)
+        anos_size_mb = int(self.args.anos_size) * 1024
+
+        # 1. Thu nhỏ NTFS File System
+        run_cmd(["ntfsfix", self.args.shrink_part], ignore_error=True)
+        log("Đang Resize NTFS... quá trình này có thể mất thời gian.", "info")
+        run_cmd(["ntfsresize", "-f", "-s", f"-{anos_size_mb}M", self.args.shrink_part], stream=True)
+
+        # 2. Resize Partition Boundary bằng parted
+        part_num = self.args.shrink_part.replace(disk, "").replace("p", "")
+        run_cmd(["parted", "-s", disk, "resizepart", part_num, f"-{anos_size_mb}MB"])
+
+        # 3. Tạo Swap (RAM / 2) và RootFS ở vùng trống (Free Space)
+        ram_gb = get_ram_gb()
+        swap_gb = max(1, ram_gb // 2)
+
+        run_cmd(["parted", "-s", disk, "mkpart", "primary", "linux-swap", f"-{anos_size_mb}MB", f"-{anos_size_mb - swap_gb*1024}MB"])
+        run_cmd(["parted", "-s", disk, "mkpart", "primary", "ext4", f"-{anos_size_mb - swap_gb*1024}MB", "100%"])
+        run_cmd(["partprobe", disk])
+        time.sleep(2)
+
+        out = subprocess.check_output(["lsblk", "-lnP", "-o", "NAME", disk]).decode().strip().split('\n')
+        parts = [f"/dev/{line.split('=\"')[1].replace('\"','')}" for line in out]
+        self.args.swap = parts[-2]
+        self.args.rootfs = parts[-1]
+
+        # Tìm phân vùng EFI của Windows để xài ké
+        if self.uefi:
+            try:
+                efi_part = subprocess.check_output("lsblk -o NAME,PARTTYPE -J", shell=True).decode()
+                self.args.boot = subprocess.check_output(
+                    f"fdisk -l {disk} | grep EFI | awk '{{print $1}}'", shell=True
+                ).decode().strip()
+            except Exception:
+                log("Không tìm thấy EFI tự động, vui lòng cẩn thận.", "warn")
+
+        log(f"Layout Dual Boot: Boot(Shared)={self.args.boot}, Swap={self.args.swap}, Root={self.args.rootfs}", "success")
 
     def install_base(self):
-        log(f"Installing Base System ({self.target_os})...", "info")
-        
-        if self.target_os == "arch" and self.args.online:
-            self._install_arch_pacstrap()
-        elif self.target_os == "debian" and self.args.online:
-            self._install_debian_debootstrap()
-        elif self.target_os == "gentoo":
-            pass 
-        else:
-            log("Mode: Offline/Clone. Running Rsync...", "warn")
-            excludes = ["--exclude=/proc/*", "--exclude=/sys/*", "--exclude=/dev/*", 
-                        "--exclude=/run/*", "--exclude=/tmp/*", "--exclude=/mnt/*", 
-                        f"--exclude={MOUNT_POINT}/*"]
-            subprocess.run(["rsync", "-axHAWXS", "--numeric-ids", "--info=progress2"] + excludes + ["/", MOUNT_POINT], check=True)
-
-    def _install_arch_pacstrap(self):
-        log("Running pacstrap...", "info")
-        pkgs = ["base", "linux", "linux-firmware", "base-devel", "nano", "networkmanager", "grub", "efibootmgr", "sudo"]
-        if self.args.profile == "desktop": pkgs.extend(["plasma-meta", "konsole", "dolphin", "sddm"])
-        run_cmd(["pacstrap", "-K", MOUNT_POINT] + pkgs, stream=True)
-        with open(f"{MOUNT_POINT}/etc/fstab", "w") as f:
-            subprocess.run(["genfstab", "-U", MOUNT_POINT], stdout=f)
-
-    def _install_debian_debootstrap(self):
-        log(f"Running debootstrap ({DEBIAN_RELEASE})...", "info")
-        run_cmd(["debootstrap", "--arch", "amd64", DEBIAN_RELEASE, MOUNT_POINT, "http://deb.debian.org/debian"], stream=True)
-        self._gen_fstab()
-        with open(f"{MOUNT_POINT}/etc/apt/sources.list", "w") as f:
-            f.write(f"deb http://deb.debian.org/debian {DEBIAN_RELEASE} main contrib non-free-firmware\n")
-            f.write(f"deb http://deb.debian.org/debian-security {DEBIAN_RELEASE}-security main contrib non-free-firmware\n")
-            f.write(f"deb http://deb.debian.org/debian {DEBIAN_RELEASE}-updates main contrib non-free-firmware\n")
+        log(f"Cài đặt Base System AnOS (Clone via Rsync)...", "info")
+        excludes = [
+            "--exclude=/proc/*", "--exclude=/sys/*", "--exclude=/dev/*",
+            "--exclude=/run/*", "--exclude=/tmp/*", "--exclude=/mnt/*",
+            f"--exclude={MOUNT_POINT}/*"
+        ]
+        subprocess.run(
+            ["rsync", "-axHAWXS", "--numeric-ids", "--info=progress2"] + excludes + ["/", MOUNT_POINT],
+            check=True
+        )
 
     def setup_chroot_mounts(self):
-        if shutil.which("arch-chroot"): return 
         log("Mounting API filesystems...", "info")
         for m in ["dev", "proc", "sys"]:
             target = os.path.join(MOUNT_POINT, m)
@@ -270,138 +305,130 @@ class ChimeraInstaller:
 
     def configure_system(self):
         log("Configuring System...", "info")
-        
-        log(f"Setting hostname to '{self.target_os}'...", "info")
+
+        hostname = self.args.host if hasattr(self.args, 'host') and self.args.host else 'AnOS'
+        log(f"Setting hostname to '{hostname}'...", "info")
         with open(f"{MOUNT_POINT}/etc/hostname", "w") as f:
-            f.write(f"{self.target_os}\n")
-        
-        if self.args.timezone:
-            tz_path = f"/usr/share/zoneinfo/{self.args.timezone}"
-            if os.path.exists(f"{MOUNT_POINT}{tz_path}"):
-                log(f"Setting timezone to {self.args.timezone}...", "info")
-                run_cmd(f"ln -sf {tz_path} /etc/localtime", chroot=True)
-                run_cmd("hwclock --systohc", chroot=True, ignore_error=True)
-            else:
-                log(f"Timezone {self.args.timezone} not found in target!", "warn")
+            f.write(f"{hostname}\n")
+
+        # Timezone
+        tz = self.args.timezone if self.args.timezone else "Asia/Ho_Chi_Minh"
+        tz_path = f"/usr/share/zoneinfo/{tz}"
+        if os.path.exists(f"{MOUNT_POINT}{tz_path}"):
+            log(f"Setting timezone to {tz}...", "info")
+            run_cmd(f"ln -sf {tz_path} /etc/localtime", chroot=True)
+            run_cmd("hwclock --systohc", chroot=True, ignore_error=True)
+
+        # Keyboard & Locale
+        run_cmd("echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen", chroot=True)
+        run_cmd("locale-gen", chroot=True, ignore_error=True)
+        run_cmd("echo 'LANG=en_US.UTF-8' > /etc/locale.conf", chroot=True)
+        run_cmd("echo 'KEYMAP=us' > /etc/vconsole.conf", chroot=True)
+
+        # Enable Network
+        run_cmd("systemctl enable NetworkManager", chroot=True, ignore_error=True)
+
+        # --- Kernel Setup ---
+        log("Extracting Kernel and building initramfs...", "info")
+        kernel_dst = f"{MOUNT_POINT}/boot/vmlinuz-linux"
+        os.makedirs(os.path.dirname(kernel_dst), exist_ok=True)
+
+        search_patterns = [
+            "/usr/lib/modules/*/vmlinuz",
+            "/boot/vmlinuz-linux",
+            "/run/archiso/bootmnt/arch/boot/x86_64/vmlinuz-linux"
+        ]
+        kernel_src = next((glob.glob(p)[0] for p in search_patterns if glob.glob(p)), None)
+
+        if kernel_src:
+            log(f"Found kernel at: {kernel_src}", "info")
+            shutil.copy(kernel_src, kernel_dst)
+            os.chmod(kernel_dst, 0o644)
         else:
-            log("No timezone specified (UTC default).", "info")
+            log("WARNING: No kernel image found. Skipping kernel copy — mkinitcpio may fail.", "warn")
 
-        if self.target_os in ["arch", "bal"]:
-            run_cmd("echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen", chroot=True)
-            run_cmd("locale-gen", chroot=True)
-            run_cmd("systemctl enable NetworkManager", chroot=True, ignore_error=True)
-            
-            if not self.args.online or self.target_os == "bal":
-                log("Offline Mode: Extracting Kernel...", "warn")
-                kernel_dst = f"{MOUNT_POINT}/boot/vmlinuz-linux"
-                os.makedirs(os.path.dirname(kernel_dst), exist_ok=True)
-                search_patterns = ["/usr/lib/modules/*/vmlinuz", "/boot/vmlinuz-linux", "/run/archiso/bootmnt/arch/boot/x86_64/vmlinuz-linux"]
-                
-                kernel_src = None
-                for pattern in search_patterns:
-                    matches = glob.glob(pattern)
-                    if matches:
-                        matches.sort(reverse=True)
-                        kernel_src = matches[0]
-                        break
-                
-                if kernel_src and os.path.exists(kernel_src):
-                    log(f"Found kernel: {kernel_src}", "success")
-                    shutil.copy(kernel_src, kernel_dst)
-                    os.chmod(kernel_dst, 0o644)
-                else:
-                    log(f"{COLORS['FAIL']}CRITICAL: Kernel not found!{COLORS['ENDC']}", "error")
+        # Xóa preset Archiso rác
+        run_cmd(
+            "rm -f /etc/mkinitcpio.conf.d/archiso.conf /etc/mkinitcpio.d/linux.preset",
+            chroot=True, ignore_error=True
+        )
 
-                log("Sanitizing mkinitcpio presets...", "info")
-                preset_dir = f"{MOUNT_POINT}/etc/mkinitcpio.d"
-                if os.path.exists(preset_dir):
-                    for preset in glob.glob(f"{preset_dir}/*.preset"):
-                        try:
-                            with open(preset, 'r') as f: content = f.read()
-                            if "archiso.conf" in content:
-                                content = content.replace("/etc/mkinitcpio.conf.d/archiso.conf", "/etc/mkinitcpio.conf")
-                                with open(preset, 'w') as f: f.write(content)
-                        except Exception: pass
+        # Sửa cấu hình hook cơ bản — xóa hook archiso
+        conf_path = f"{MOUNT_POINT}/etc/mkinitcpio.conf"
+        try:
+            with open(conf_path, 'r') as f:
+                config_data = f.read()
+            if "archiso" in config_data:
+                log("Removing archiso hooks from mkinitcpio.conf...", "info")
+                config_data = config_data.replace("archiso", "block filesystems fsck")
+                with open(conf_path, 'w') as f:
+                    f.write(config_data)
+        except Exception as e:
+            log(f"Could not patch mkinitcpio.conf: {e}", "warn")
 
-                conf_path = f"{MOUNT_POINT}/etc/mkinitcpio.conf"
-                try:
-                    with open(conf_path, 'r') as f: config_data = f.read()
-                    if "archiso" in config_data:
-                        std_hooks = 'HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block filesystems fsck)'
-                        lines = config_data.splitlines()
-                        new_lines = []
-                        for line in lines:
-                            if line.strip().startswith("HOOKS") and "archiso" in line:
-                                new_lines.append(f"# {line}")
-                                new_lines.append(std_hooks)
-                            else:
-                                new_lines.append(line)
-                        with open(conf_path, 'w') as f: f.write("\n".join(new_lines))
-                except Exception: pass
+        # *** FIX: Run mkinitcpio with ignore_error=True ***
+        # mkinitcpio can fail if the chroot environment is not fully set up
+        # (e.g., missing kernel modules directory). This is non-fatal —
+        # the Welcome App / first-boot setup can regenerate initramfs.
+        if kernel_src:
+            log("Running mkinitcpio -P...", "info")
+            success = run_cmd("mkinitcpio -P", chroot=True, stream=True, ignore_error=True, check=False)
+            if not success:
+                log("mkinitcpio -P failed — initramfs may need to be regenerated on first boot.", "warn")
+        else:
+            log("Skipping mkinitcpio -P (no kernel found). Run manually after install.", "warn")
 
-                if os.path.exists(f"{MOUNT_POINT}/etc/mkinitcpio.conf.d/archiso.conf"):
-                    os.remove(f"{MOUNT_POINT}/etc/mkinitcpio.conf.d/archiso.conf")
+        # GHI LẠI FILE /etc/installation-type ĐỂ WELCOME APP BIẾT
+        log("Ghi nhận thông tin Installation Type...", "info")
+        with open(f"{MOUNT_POINT}/etc/installation-type", "w") as f:
+            f.write(f"ONLINE={self.is_online}\n")
+            f.write(f"PROFILES={self.args.profiles}\n")
 
-                log("Rebuilding initramfs...", "info")
-                run_cmd("mkinitcpio -P", chroot=True, stream=True)
-
-            if self.target_os == "bal":
-                log("Applying Blue Archive Linux (BAL) specifics...", "info")
-                run_cmd("systemctl enable sddm", chroot=True, ignore_error=True)
-                log("Running /root/SilentSDDM/install.sh...", "info")
-                run_cmd("bash /root/SilentSDDM/install.sh", chroot=True, stream=True)
-                run_cmd("touch /etc/bal-installed", chroot=True, ignore_error=True)
-
-        elif self.target_os == "debian":
-            if not shutil.which("arch-chroot"): self.setup_chroot_mounts()
-            env = {"DEBIAN_FRONTEND": "noninteractive"}
-            run_cmd("apt-get update", chroot=True, env=env)
-            run_cmd("apt-get install -y linux-image-amd64 linux-headers-amd64 locales grub-efi-amd64 network-manager sudo", chroot=True, env=env, stream=True)
-            run_cmd("echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen", chroot=True)
-            run_cmd("locale-gen", chroot=True)
+        # Sinh file fstab
+        self._gen_fstab()
 
     def setup_users(self):
         pwd = self.args.passwd
         if pwd:
             log("Setting ROOT password...", "info")
             run_cmd(f"echo 'root:{pwd}' | chpasswd", chroot=True)
-        else:
-            log("No --passwd provided. Defaulting ROOT password to 'root'.", "warn")
-            run_cmd("echo 'root:root' | chpasswd", chroot=True)
 
         if self.args.user:
             user = self.args.user
             log(f"Creating user '{user}'...", "info")
-            if not run_cmd(f"useradd -m -G wheel -s /bin/bash {user}", chroot=True, ignore_error=True):
-                log(f"User {user} might already exist or creation failed.", "warn")
-
+            run_cmd(f"useradd -m -G wheel -s /bin/bash {user}", chroot=True, ignore_error=True)
             if pwd:
-                log(f"Setting password for user '{user}'...", "info")
                 run_cmd(f"echo '{user}:{pwd}' | chpasswd", chroot=True)
 
             log("Configuring sudo access...", "info")
-            run_cmd("sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers", chroot=True, ignore_error=True)
-            log(f"User '{user}' added to wheel group with sudo access.", "success")
+            run_cmd(
+                "sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers",
+                chroot=True, ignore_error=True
+            )
 
+    def install_packages(self):
+        """Xử lý cài đặt packages online theo profile và giải quyết NVIDIA Final Boss"""
+        if self.is_online and self.args.packages:
+            log("Online Mode: Khởi tạo Pacman Keyring & Cài đặt phần mềm theo Profile...", "HEADER")
+            run_cmd("pacman-key --init", chroot=True, ignore_error=True)
+            run_cmd("pacman-key --populate", chroot=True, ignore_error=True)
+            run_cmd("pacman -Sy", chroot=True, ignore_error=True)
 
-    def install_bal_extras(self):
-        if self.target_os == "bal" and self.args.online:
-            if not self.args.user:
-                log("Skipping BAL Online Extras: No user provided.", "warn")
-                return
+            pkgs = self.args.packages.replace(',', ' ')
+            log(f"Đang cài đặt các packages: {pkgs}", "info")
+            run_cmd(f"pacman -S --noconfirm {pkgs}", chroot=True, stream=True)
+        else:
+            log("Offline Mode hoặc Không có packages. Việc cài đặt Profile sẽ được Welcome App đảm nhận sau.", "warn")
 
-            log("BAL Online Mode: Initializing Keyring...", "HEADER")
-            
-            # Initialize keyring to ensure pacman works correctly
-            run_cmd("pacman-key --init", chroot=True)
-            run_cmd("pacman-key --populate", chroot=True)
-            
-            # Note: Yay installation removed as requested due to root/sudo issues
-
-    def run_custom_scripts(self):
-        if not self.args.run: return
-        log(f"Running Post-Install Command: {self.args.run}", "warn")
-        run_cmd(self.args.run, chroot=True, stream=True)
+        # --- NVIDIA FINAL BOSS ---
+        log("Kiểm tra GPU NVIDIA...", "info")
+        if detect_nvidia():
+            log(">>> PHÁT HIỆN CARD NVIDIA. Kích hoạt Mainline Driver... <<<", "HEADER")
+            if self.is_online:
+                run_cmd("pacman -S --noconfirm nvidia nvidia-utils nvidia-settings", chroot=True, stream=True)
+            self.has_nvidia = True
+        else:
+            self.has_nvidia = False
 
     def _gen_fstab(self):
         if shutil.which("genfstab"):
@@ -419,92 +446,97 @@ class ChimeraInstaller:
                     f.write(f"UUID={boot_uuid} {mount} {fs_type} defaults 0 2\n")
 
     def install_bootloader(self):
-        log("Installing Bootloader...", "info")
-        
-        # Configure /etc/default/grub
+        log("Installing Bootloader (GRUB)...", "info")
+
         grub_path = f"{MOUNT_POINT}/etc/default/grub"
         if os.path.exists(grub_path):
-            log("Configuring /etc/default/grub...", "info")
-            
-            pretty_name = self.target_os.capitalize()
-            os_release = f"{MOUNT_POINT}/etc/os-release"
-            if os.path.exists(os_release):
-                try:
-                    with open(os_release, 'r') as f:
-                        for line in f:
-                            if line.startswith("PRETTY_NAME="):
-                                pretty_name = line.split("=", 1)[1].strip().strip('"').strip("'")
-                                break
-                except Exception: pass
-            
             try:
-                with open(grub_path, 'r') as f: lines = f.readlines()
+                with open(grub_path, 'r') as f:
+                    lines = f.readlines()
                 with open(grub_path, 'w') as f:
                     for line in lines:
                         if line.strip().startswith("GRUB_DISTRIBUTOR="):
-                            f.write(f"GRUB_DISTRIBUTOR='{pretty_name}'\n")
-                        elif self.target_os in ["arch", "bal"] and line.strip().startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
-                            new_line = line.replace("quiet", "").replace("  ", " ")
-                            f.write(new_line)
+                            f.write("GRUB_DISTRIBUTOR='AnOS'\n")
+                        elif line.strip().startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+                            new_line = line.replace("quiet", "").replace("  ", " ").strip()
+                            if new_line.endswith('"'):
+                                new_line = new_line[:-1]
+                            if self.has_nvidia:
+                                new_line += " nvidia_drm.modeset=1 nouveau.modeset=0\""
+                            else:
+                                new_line += " quiet\""
+                            f.write(new_line + "\n")
                         else:
                             f.write(line)
             except Exception as e:
                 log(f"Failed to edit grub config: {e}", "warn")
 
         target = "x86_64-efi" if self.uefi else "i386-pc"
-        boot_id = self.target_os 
+        boot_id = "AnOS"
 
-        if self.target_os == "debian":
-            if self.uefi:
-                run_cmd(f"grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id={boot_id} --recheck", chroot=True)
-            else:
-                run_cmd(f"grub-install --target=i386-pc {self.disk}", chroot=True)
-            run_cmd("update-grub", chroot=True)
+        cmd = ["grub-install", f"--target={target}", f"--bootloader-id={boot_id}", "--recheck"]
+        if self.uefi:
+            cmd.append("--efi-directory=/boot/efi")
         else:
-            cmd = ["grub-install", f"--target={target}", f"--bootloader-id={boot_id}", "--recheck"]
-            if self.uefi: cmd.append("--efi-directory=/boot/efi")
-            else: cmd.append(self.disk)
-            
-            run_cmd(cmd, chroot=True)
-            run_cmd("grub-mkconfig -o /boot/grub/grub.cfg", chroot=True)
+            cmd.append(self.disk)
+
+        run_cmd(cmd, chroot=True, stream=True)
+        run_cmd("grub-mkconfig -o /boot/grub/grub.cfg", chroot=True, stream=True)
+
+    def run_custom_scripts(self):
+        if not self.args.run: return
+        log(f"Running Post-Install Command: {self.args.run}", "warn")
+        run_cmd(self.args.run, chroot=True, stream=True)
 
     def finalize(self):
         run_cmd("systemd-machine-id-setup", chroot=True, ignore_error=True)
 
     def cleanup(self):
-        log("Cleaning up...", "info")
+        log("Cleaning up mounts...", "info")
         run_cmd(["umount", "-R", MOUNT_POINT], check=False, ignore_error=True)
 
 # --- Entry Point ---
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--disk", help="Auto Partition Mode (e.g., /dev/sda)")
+
+    # Disk Setup Arguments
+    parser.add_argument("--disk", help="Full Disk Wipe Mode (e.g., /dev/sda)")
+    parser.add_argument("--shrink-part", help="Dual Boot: Partition Windows muốn cắt (e.g., /dev/nvme0n1p3)")
+    parser.add_argument("--anos-size", help="Dual Boot: Dung lượng (GB) lấy ra để cài AnOS")
     parser.add_argument("--boot", help="Manual: Boot partition")
     parser.add_argument("--rootfs", help="Manual: Root partition")
-    parser.add_argument("--swap", help="Swap size (Auto) or partition (Manual)")
-    parser.add_argument("--target", default="arch", choices=["arch", "gentoo", "debian", "generic", "bal"])
-    parser.add_argument("--online", action="store_true", help="Use pacstrap/debootstrap instead of cloning (Except BAL)")
-    parser.add_argument("--init", choices=["systemd", "openrc"], default="systemd")
-    parser.add_argument("--profile", choices=["cli", "desktop"], default="cli")
-    
+    parser.add_argument("--swap", help="Manual: Swap partition")
+
+    # AnOS Configuration Arguments
+    parser.add_argument("--target", default="anos", choices=["anos"])
+    parser.add_argument("--profiles", default="minimal", help="Comma-separated profiles: minimal,office,gaming,dev")
+    parser.add_argument("--packages", help="Comma-separated list các packages để cài đặt lúc chroot (truyền từ GUI)")
+
+    # User & System
     parser.add_argument("--user", help="Create a new user")
     parser.add_argument("--passwd", help="Password for the new user AND root")
+    parser.add_argument("--host", default="AnOS", help="Computer Name (Hostname)")
+    parser.add_argument("--timezone", default="Asia/Ho_Chi_Minh", help="Set Timezone (e.g. Asia/Ho_Chi_Minh)")
+
     parser.add_argument("--run", help="Custom command to run inside chroot after install")
-    parser.add_argument("--timezone", help="Set Timezone (e.g. Asia/Ho_Chi_Minh)")
     parser.add_argument("--debug", action="store_true", help="Enable verbose output")
-    
-    parser.add_argument("--i-am-very-stupid", action="store_true")
-    
+    parser.add_argument("--i-am-very-stupid", action="store_true", help="Bypass safety warning prompt")
+
     args = parser.parse_args()
-    
+
     global DEBUG_MODE
     DEBUG_MODE = args.debug
 
-    if os.geteuid() != 0: sys.exit("Run as root.")
-    if not args.disk and not (args.boot and args.rootfs):
-        sys.exit("Error: Must specify --disk OR (--boot and --rootfs)")
+    if os.geteuid() != 0:
+        sys.exit("Run as root.")
 
-    ChimeraInstaller(args).run()
+    if not args.disk and not args.shrink_part and not (args.boot and args.rootfs):
+        sys.exit("Error: Phải chỉ định `--disk` HOẶC (`--shrink-part` + `--anos-size`) HOẶC (`--boot` + `--rootfs`)")
+
+    if args.shrink_part and not args.anos_size:
+        sys.exit("Error: Chế độ Dual Boot cần cung cấp `--anos-size` (GB)")
+
+    AnOSInstaller(args).run()
 
 if __name__ == "__main__":
     main()
