@@ -1,770 +1,537 @@
 #!/usr/bin/env python3
-import sys
 import os
+import sys
+import argparse
 import subprocess
-import json
 import shutil
+import time
 import socket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QLabel, QStackedWidget, QPushButton,
-                               QRadioButton, QComboBox, QLineEdit, QCheckBox,
-                               QFrame, QListWidget, QListWidgetItem, QMessageBox,
-                               QTextEdit, QProgressBar, QSpinBox, QGroupBox,
-                               QDialog, QToolButton)
-from PySide6.QtCore import Qt, QProcess, QTimer
-from PySide6.QtGui import QPixmap, QIcon, QFont, QTextCursor
+import shlex
+import glob
+import json
 
 # --- Configuration & Constants ---
-ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
-LOCAL_LOGO_PATH = os.path.join(ASSET_DIR, "logo.png")
-BG_PATH = os.path.join(ASSET_DIR, "/usr/share/pixmaps/backg.png")
-BACKEND_SCRIPT = "./chimera.py" 
-ZONEINFO_PATH = "/usr/share/zoneinfo"
-
-# Danh sách Packages theo Profile
-PKG_MAP = {
-    # Minimal / Base (Luôn có)
-    "google-chrome": "minimal",
-    "sudo-gui": "minimal",
-    "freetube-bin": "minimal",
-    "harmonymusic": "minimal",
-    # Office
-    "libreoffice-fresh": "office",
-    # Gaming
-    "wine": "gaming",
-    "gamemode": "gaming",
-    "mangohud": "gaming",
-    "steam": "gaming",
-    # Dev
-    "neovim": "dev",
-    "vim": "dev",
-    "python": "dev",
-    "git": "dev",
-    "gcc": "dev",
-    "clang": "dev",
-    "rustup": "dev",
-    "flutter-bin": "dev",
-    "android-studio": "dev",
-    "visual-studio-code-bin": "dev"
+COLORS = {
+    'HEADER': '\033[95m', 'BLUE': '\033[94m', 'GREEN': '\033[92m',
+    'WARN': '\033[93m', 'FAIL': '\033[91m', 'ENDC': '\033[0m', 'BOLD': '\033[1m'
 }
+MOUNT_POINT = "/mnt/anos_target"
+DEBUG_MODE = False
 
 # --- Utility Functions ---
-def get_os_release():
-    info = {
-        "NAME": "AnOS",
-        "PRETTY_NAME": "AnOS",
-        "LOGO": "anos"
-    }
+def log(msg, level="info"):
+    icon = "[*]"
+    color = COLORS['BLUE']
+    if level == "error": icon, color = "[!]", COLORS['FAIL']
+    elif level == "success": icon, color = "[+]", COLORS['GREEN']
+    elif level == "warn": icon, color = "[?]", COLORS['WARN']
+    elif level == "HEADER": icon, color = "[#]", COLORS['HEADER']
+    elif level == "DEBUG": icon, color = "[D]", COLORS['WARN']
+
+    print(f"{color}{icon} {msg}{COLORS['ENDC']}")
+
+def run_cmd(cmd, shell=False, check=True, chroot=False, ignore_error=False, env=None, stream=False):
+    show_output = stream or DEBUG_MODE
+
+    if chroot:
+        if isinstance(cmd, list): cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
+        else: cmd_str = cmd
+
+        if shutil.which("arch-chroot"):
+            cmd =["arch-chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
+        else:
+            cmd =["chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
+        shell = False
+
+    if DEBUG_MODE:
+        log(f"CMD: {cmd}", "DEBUG")
+
     try:
-        os_release_path = "/etc/os_release" if not os.path.exists("/etc/os-release") else "/etc/os-release"
-        if os.path.exists(os_release_path):
-            with open(os_release_path) as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.strip().split("=", 1)
-                        info[k] = v.strip('"').strip("'")
-    except Exception:
-        pass
-    return info
-
-# --- Custom Widgets ---
-class StepItem(QListWidgetItem):
-    def __init__(self, text):
-        super().__init__(text)
-        self.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        font = QFont()
-        font.setPointSize(11)
-        self.setFont(font)
-
-class DebugDialog(QDialog):
-    def __init__(self, parent=None, command="", dry_run=False):
-        super().__init__(parent)
-        self.setWindowTitle("Installer Settings (Debug)")
-        self.resize(600, 400)
-        
-        layout = QVBoxLayout(self)
-        self.chk_dry_run = QCheckBox("Enable Dry Run (Do not write to disk)")
-        self.chk_dry_run.setChecked(dry_run)
-        layout.addWidget(self.chk_dry_run)
-        
-        layout.addWidget(QLabel("Generated Backend Command:"))
-        self.txt_cmd = QTextEdit()
-        self.txt_cmd.setPlainText(command)
-        self.txt_cmd.setReadOnly(True)
-        layout.addWidget(self.txt_cmd)
-        
-        btn_close = QPushButton("Apply & Close")
-        btn_close.clicked.connect(self.accept)
-        layout.addWidget(btn_close)
-
-# --- Main Window ---
-class InstallerWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-
-        self.os_info = get_os_release()
-        self.distro_name = "AnOS"
-        self.setWindowTitle(f"{self.distro_name} Installer")
-        self.resize(1000, 700)
-
-        self.dry_run = False
-        self.is_online = self.check_internet()
-        
-        self.install_data = {
-            "install_type": "online" if self.is_online else "offline",
-            "disk": None, "root": None, "boot": None, "swap": None,
-            "method": "whole", "shrink_part": None, "anos_size": 0,
-            "user": "", "pass": "", "host": "anos-pc", "tz": "Asia/Ho_Chi_Minh",
-            "keyboard": "us", "profiles": ["minimal"], "packages":[]
-        }
-
-        self.setup_ui()
-        self.check_root()
-
-    def check_root(self):
-        if os.geteuid() != 0:
-            QMessageBox.warning(self, "Root Required", "Running without root privileges.\nDisk operations will fail.")
-
-    def check_internet(self):
-        try:
-            socket.create_connection(("1.1.1.1", 53), timeout=3)
-            return True
-        except OSError:
-            pass
+        if show_output:
+            proc = subprocess.run(cmd, shell=shell, check=check, env=env)
+        else:
+            proc = subprocess.run(cmd, shell=shell, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        return proc.returncode == 0
+    except subprocess.CalledProcessError as e:
+        if not ignore_error:
+            log(f"Command Failed: {cmd}", "error")
+            if hasattr(e, 'stderr') and e.stderr:
+                print(f"{COLORS['FAIL']}STDERR: {e.stderr.decode().strip()}{COLORS['ENDC']}")
+            elif show_output:
+                print(f"{COLORS['FAIL']}(Command failed, output above){COLORS['ENDC']}")
+            if check and not ignore_error:
+                raise e
         return False
 
-    def setup_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+def check_connection():
+    """Kiểm tra kết nối mạng (BƯỚC 1 - Treemap)"""
+    try:
+        socket.create_connection(("1.1.1.1", 53), timeout=3)
+        return True
+    except OSError:
+        return False
 
-        # --- Sidebar ---
-        self.sidebar = QFrame()
-        self.sidebar.setFixedWidth(240)
-        self.sidebar.setFrameShape(QFrame.StyledPanel)
-        
-        side_layout = QVBoxLayout(self.sidebar)
-        side_layout.setContentsMargins(0, 0, 0, 15)
-        side_layout.setSpacing(10)
+def get_blk_value(device, field):
+    try:
+        return subprocess.check_output(["lsblk", "-no", field, device], stderr=subprocess.DEVNULL).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
 
-        lbl_logo = QLabel()
-        lbl_logo.setAlignment(Qt.AlignCenter)
-        lbl_logo.setFixedHeight(140)
+def get_ram_gb():
+    """Lấy dung lượng RAM để tính Swap = RAM / 2"""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if 'MemTotal' in line:
+                    return max(1, int(line.split()[1]) // 1048576)
+    except Exception:
+        pass
+    return 4  # Mặc định nếu không đọc được là 4GB
 
-        if os.path.exists(LOCAL_LOGO_PATH):
-            pix = QPixmap(LOCAL_LOGO_PATH).scaled(110, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            lbl_logo.setPixmap(pix)
-        else:
-            lbl_logo.setText(self.distro_name)
-            font = QFont()
-            font.setBold(True)
-            font.setPointSize(20)
-            lbl_logo.setFont(font)
+def detect_nvidia():
+    """Nhận diện Card NVIDIA"""
+    try:
+        out = subprocess.check_output(["lspci"]).decode().lower()
+        return "nvidia" in out and ("vga" in out or "3d" in out)
+    except Exception:
+        return False
 
-        side_layout.addWidget(lbl_logo)
+# --- Main Installer Class ---
+class AnOSInstaller:
+    def __init__(self, args):
+        self.args = args
+        self.uefi = os.path.exists("/sys/firmware/efi")
+        self.target_os = args.target.lower()
+        self.disk = args.disk if args.disk else self._detect_disk(args.rootfs)
+        self.is_online = check_connection()
+        self.has_nvidia = False
 
-        self.step_list = QListWidget()
-        self.step_list.setFocusPolicy(Qt.NoFocus)
-        steps =["Welcome", "Location & KB", "Profile", "Disk Setup", "Partitions", "Users", "Summary", "Install"]
-        for s in steps: self.step_list.addItem(StepItem(s))
-        self.step_list.setCurrentRow(0)
-        side_layout.addWidget(self.step_list)
+        if self.args.user and not self.args.passwd:
+            sys.exit(f"{COLORS['FAIL']}Error: --user requires --passwd{COLORS['ENDC']}")
 
-        self.btn_debug = QToolButton()
-        self.btn_debug.setText("⚙")
-        self.btn_debug.setCursor(Qt.PointingHandCursor)
-        self.btn_debug.clicked.connect(self.open_debug_settings)
-        self.btn_debug.setFixedSize(40, 40)
-
-        bot_layout = QHBoxLayout()
-        bot_layout.setContentsMargins(15, 0, 0, 0)
-        bot_layout.addWidget(self.btn_debug)
-        bot_layout.addStretch()
-        side_layout.addLayout(bot_layout)
-        main_layout.addWidget(self.sidebar)
-
-        # --- Content ---
-        self.content_container = QWidget()
-        content_layout = QVBoxLayout(self.content_container)
-        content_layout.setContentsMargins(40, 40, 40, 40)
-
-        self.lbl_header = QLabel(f"Welcome to {self.distro_name}")
-        header_font = QFont()
-        header_font.setPointSize(20)
-        header_font.setBold(True)
-        self.lbl_header.setFont(header_font)
-        content_layout.addWidget(self.lbl_header)
-
-        self.pages = QStackedWidget()
-        content_layout.addWidget(self.pages)
-
-        nav_layout = QHBoxLayout()
-        nav_layout.setContentsMargins(0, 20, 0, 0)
-        self.btn_back = QPushButton("Back")
-        self.btn_next = QPushButton("Next")
-        self.btn_back.clicked.connect(self.go_back)
-        self.btn_next.clicked.connect(self.go_next)
-
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.btn_back)
-        nav_layout.addWidget(self.btn_next)
-        content_layout.addLayout(nav_layout)
-        main_layout.addWidget(self.content_container)
-
-        self.init_pages()
-        self.update_nav()
-
-    def init_pages(self):
-        # 0. Welcome
-        p_welcome = QWidget()
-        vbox = QVBoxLayout(p_welcome)
-        lbl_hero = QLabel()
-        lbl_hero.setAlignment(Qt.AlignCenter)
-        if os.path.exists(BG_PATH):
-            pix = QPixmap(BG_PATH).scaled(700, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            lbl_hero.setPixmap(pix)
-        else:
-            lbl_hero.setText(f"{self.distro_name}\nInstaller")
-            lbl_hero.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-            lbl_hero.setFixedSize(700, 350)
-
-        net_status = "<span style='color:green;'>Online</span>" if self.is_online else "<span style='color:red;'>Offline (Fallback Mode)</span>"
-        welcome_str = f"<h3>Triết lý: Dễ dùng, Dễ hiểu</h3>Network Status: <b>{net_status}</b><br><br>Chào mừng bạn đến với trình cài đặt AnOS."
-        lbl_text = QLabel(welcome_str)
-        lbl_text.setAlignment(Qt.AlignCenter)
-        lbl_text.setWordWrap(True)
-        lbl_text.setContentsMargins(0, 20, 0, 0)
-        
-        vbox.addStretch()
-        vbox.addWidget(lbl_hero)
-        vbox.addWidget(lbl_text)
-        vbox.addStretch()
-        self.pages.addWidget(p_welcome)
-
-        # 1. Location & Keyboard
-        p_loc = QWidget()
-        vbox = QVBoxLayout(p_loc)
-
-        vbox.addWidget(QLabel("<b>Select Region:</b>"))
-        self.cmb_region = QComboBox()
-        self.cmb_region.currentTextChanged.connect(self.populate_cities)
-        vbox.addWidget(self.cmb_region)
-
-        vbox.addWidget(QLabel("<b>Select Zone/City:</b>"))
-        self.cmb_city = QComboBox()
-        vbox.addWidget(self.cmb_city)
-        self.populate_regions()
-
-        vbox.addWidget(QLabel("<b>Keyboard Layout:</b>"))
-        self.cmb_kbd = QComboBox()
-        self.cmb_kbd.addItems(["us", "uk", "fr", "de", "vn", "es"])
-        vbox.addWidget(self.cmb_kbd)
-
-        vbox.addStretch()
-        self.pages.addWidget(p_loc)
-
-        # 2. Profile Selection
-        p_prof = QWidget()
-        vbox = QVBoxLayout(p_prof)
-        vbox.addWidget(QLabel("<b>Chọn Profile (Mục đích sử dụng):</b>\n*Minimal mặc định luôn được chọn."))
-        
-        hbox = QHBoxLayout()
-        self.chk_office = QCheckBox("Office (Văn phòng)")
-        self.chk_gaming = QCheckBox("Gaming (Chơi game)")
-        self.chk_dev = QCheckBox("Dev (Lập trình)")
-        
-        self.chk_office.toggled.connect(self.update_package_list)
-        self.chk_gaming.toggled.connect(self.update_package_list)
-        self.chk_dev.toggled.connect(self.update_package_list)
-
-        hbox.addWidget(self.chk_office)
-        hbox.addWidget(self.chk_gaming)
-        hbox.addWidget(self.chk_dev)
-        vbox.addLayout(hbox)
-
-        vbox.addWidget(QLabel("<b>Tùy chỉnh Packages:</b>"))
-        self.lst_packages = QListWidget()
-        for pkg, prof in PKG_MAP.items():
-            item = QListWidgetItem(f"{pkg} ({prof})")
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            # Default check minimal
-            if prof == "minimal":
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
-            item.setData(Qt.UserRole, pkg)
-            item.setData(Qt.UserRole + 1, prof)
-            self.lst_packages.addItem(item)
-
-        vbox.addWidget(self.lst_packages)
-        if not self.is_online:
-            vbox.addWidget(QLabel("<span style='color:red;'>*Offline: Các packages sẽ được ghi nhận và cài đặt sau bởi Welcome App khi có mạng.</span>"))
-            
-        self.pages.addWidget(p_prof)
-
-        # 3. Disk Setup
-        p_disk = QWidget()
-        vbox = QVBoxLayout(p_disk)
-
-        grp = QGroupBox("Thiết lập Ổ đĩa (Setup Disk)")
-        gv = QVBoxLayout()
-        
-        self.rad_whole = QRadioButton("Choose full disk (Sử dụng toàn bộ ổ cứng)")
-        self.rad_dual = QRadioButton("Dual boot setup (Cài song song với Windows hiện tại)")
-        self.rad_manual = QRadioButton("Manual partition (Dành cho Advance User)")
-        self.rad_whole.setChecked(True)
-        
-        self.rad_whole.toggled.connect(self.toggle_disk_ui)
-        self.rad_dual.toggled.connect(self.toggle_disk_ui)
-        self.rad_manual.toggled.connect(self.toggle_disk_ui)
-        
-        gv.addWidget(self.rad_whole)
-        gv.addWidget(self.rad_dual)
-        gv.addWidget(self.rad_manual)
-        grp.setLayout(gv)
-        vbox.addWidget(grp)
-
-        # Widget cho Whole Disk
-        self.wid_whole = QWidget()
-        v_whole = QVBoxLayout(self.wid_whole)
-        v_whole.setContentsMargins(0,0,0,0)
-        v_whole.addWidget(QLabel("<b>Select Storage Drive to Wipe:</b>"))
-        self.cmb_disk = QComboBox()
-        v_whole.addWidget(self.cmb_disk)
-        warn_lbl = QLabel("<span style='color:red;'>⚠️ CẢNH BÁO ĐỎ: Sẽ FORMAT và BAY MÀU TOÀN BỘ dữ liệu trên ổ đĩa!</span>")
-        v_whole.addWidget(warn_lbl)
-        vbox.addWidget(self.wid_whole)
-
-        # Widget cho Dual Boot
-        self.wid_dual = QWidget()
-        v_dual = QVBoxLayout(self.wid_dual)
-        v_dual.setContentsMargins(0,0,0,0)
-        v_dual.addWidget(QLabel("<b>Chọn ổ đĩa chứa Windows (NTFS) để thu nhỏ:</b>"))
-        self.cmb_ntfs = QComboBox()
-        v_dual.addWidget(self.cmb_ntfs)
-        
-        h_spin = QHBoxLayout()
-        h_spin.addWidget(QLabel("Dung lượng cắt ra cho AnOS (GB):"))
-        self.spin_anos_size = QSpinBox()
-        self.spin_anos_size.setRange(20, 2000) # Min 20GB cho AnOS
-        self.spin_anos_size.setValue(40)
-        h_spin.addWidget(self.spin_anos_size)
-        v_dual.addLayout(h_spin)
-        self.wid_dual.setVisible(False)
-        vbox.addWidget(self.wid_dual)
-
-        self.refresh_disks()
-        vbox.addStretch()
-        self.pages.addWidget(p_disk)
-
-        # 4. Partitions (Manual Only)
-        p_part = QWidget()
-        vbox = QVBoxLayout(p_part)
-        info = QLabel("<b>Partition Manager</b><br>Dùng cfdisk chia ổ đĩa, sau đó Refresh và chọn Mount point.")
-        vbox.addWidget(info)
-        btn_cfdisk = QPushButton(" Mở GParted / cfdisk")
-        btn_cfdisk.setIcon(QIcon.fromTheme("utilities-terminal"))
-        btn_cfdisk.clicked.connect(self.launch_cfdisk)
-        vbox.addWidget(btn_cfdisk)
-
-        part_grid = QGroupBox("Mount Point Assignment")
-        pg_layout = QVBoxLayout(part_grid)
-        pg_layout.addWidget(QLabel("Root Partition (/):"))
-        self.cmb_root = QComboBox()
-        pg_layout.addWidget(self.cmb_root)
-        pg_layout.addWidget(QLabel("Boot Partition (/boot or EFI):"))
-        self.cmb_boot = QComboBox()
-        pg_layout.addWidget(self.cmb_boot)
-        pg_layout.addWidget(QLabel("Swap Partition (Tùy chọn):"))
-        self.cmb_swap = QComboBox()
-        pg_layout.addWidget(self.cmb_swap)
-        btn_refresh = QPushButton("Làm mới danh sách phân vùng")
-        btn_refresh.clicked.connect(self.populate_partitions)
-        pg_layout.addWidget(btn_refresh)
-        vbox.addWidget(part_grid)
-        vbox.addStretch()
-        self.pages.addWidget(p_part)
-
-        # 5. Users
-        p_user = QWidget()
-        form = QVBoxLayout(p_user)
-        self.inp_host = QLineEdit("anos-pc")
-        self.inp_user = QLineEdit()
-        self.inp_pass = QLineEdit()
-        self.inp_pass.setEchoMode(QLineEdit.Password)
-        form.addWidget(QLabel("Computer Name (Hostname):"))
-        form.addWidget(self.inp_host)
-        form.addWidget(QLabel("Username:"))
-        form.addWidget(self.inp_user)
-        form.addWidget(QLabel("Password (Dùng chung cho Root & User):"))
-        form.addWidget(self.inp_pass)
-        form.addStretch()
-        self.pages.addWidget(p_user)
-
-        # 6. Summary
-        p_sum = QWidget()
-        vbox = QVBoxLayout(p_sum)
-        self.txt_sum = QTextEdit()
-        self.txt_sum.setReadOnly(True)
-        vbox.addWidget(QLabel("Installation Summary:"))
-        vbox.addWidget(self.txt_sum)
-        self.pages.addWidget(p_sum)
-
-        # 7. Install
-        p_inst = QWidget()
-        vbox = QVBoxLayout(p_inst)
-        self.lbl_progress = QLabel("Waiting to start...")
-        self.lbl_progress.setAlignment(Qt.AlignCenter)
-        self.pbar = QProgressBar()
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        font_mono = QFont("Monospace")
-        font_mono.setStyleHint(QFont.Monospace)
-        self.txt_log.setFont(font_mono)
-        
-        vbox.addStretch()
-        vbox.addWidget(self.lbl_progress)
-        vbox.addWidget(self.pbar)
-        vbox.addWidget(self.txt_log)
-        vbox.addStretch()
-        self.pages.addWidget(p_inst)
-
-    def toggle_disk_ui(self):
-        self.wid_whole.setVisible(self.rad_whole.isChecked())
-        self.wid_dual.setVisible(self.rad_dual.isChecked())
-
-    def update_package_list(self):
-        active_profiles = ["minimal"]
-        if self.chk_office.isChecked(): active_profiles.append("office")
-        if self.chk_gaming.isChecked(): active_profiles.append("gaming")
-        if self.chk_dev.isChecked(): active_profiles.append("dev")
-
-        for i in range(self.lst_packages.count()):
-            item = self.lst_packages.item(i)
-            prof = item.data(Qt.UserRole + 1)
-            if prof in active_profiles:
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
-
-    # --- Timezone Logic ---
-    def populate_regions(self):
-        self.cmb_region.blockSignals(True)
-        self.cmb_region.clear()
-
-        if not os.path.exists(ZONEINFO_PATH):
-            self.cmb_region.addItem("UTC")
-            return
-
-        regions =[]
-        has_global_files = False
-
-        for entry in os.listdir(ZONEINFO_PATH):
-            full_path = os.path.join(ZONEINFO_PATH, entry)
-            if os.path.isdir(full_path):
-                if entry not in["posix", "right", "SystemV", "Etc", "posixrules"]:
-                    regions.append(entry)
-            elif os.path.isfile(full_path) and entry[0].isupper() and not entry.endswith(".tab"):
-                has_global_files = True
-
-        regions.sort()
-        if has_global_files:
-            regions.insert(0, "Global")
-
-        self.cmb_region.addItems(regions)
-        self.cmb_region.blockSignals(False)
-
-        # Try to auto set Asia/Ho_Chi_Minh for AnOS default
-        idx = self.cmb_region.findText("Asia")
-        if idx >= 0:
-            self.cmb_region.setCurrentIndex(idx)
-            self.populate_cities("Asia")
-            idx_c = self.cmb_city.findData("Asia/Ho_Chi_Minh")
-            if idx_c >= 0: self.cmb_city.setCurrentIndex(idx_c)
-
-    def populate_cities(self, region):
-        self.cmb_city.clear()
-        if region == "Global":
-            for entry in sorted(os.listdir(ZONEINFO_PATH)):
-                full = os.path.join(ZONEINFO_PATH, entry)
-                if os.path.isfile(full) and entry[0].isupper() and not entry.endswith(".tab"):
-                    self.cmb_city.addItem(entry, entry)
-        else:
-            base_path = os.path.join(ZONEINFO_PATH, region)
-            if not os.path.exists(base_path): return
-
-            zones =[]
-            for root, dirs, files in os.walk(base_path):
-                for f in files:
-                    if f.startswith(".") or f.endswith(".tab"): continue
-                    abs_path = os.path.join(root, f)
-                    rel_display = os.path.relpath(abs_path, base_path)
-                    full_tz = f"{region}/{rel_display}"
-                    zones.append((rel_display, full_tz))
-
-            zones.sort(key=lambda x: x[0])
-            for display, data in zones:
-                self.cmb_city.addItem(display, data)
-
-    def refresh_disks(self):
-        self.cmb_disk.clear()
-        self.cmb_ntfs.clear()
+    def _detect_disk(self, partition):
         try:
-            # Load full disks
-            out = subprocess.check_output(["lsblk", "-d", "-n", "-o", "NAME,SIZE,MODEL,TYPE", "-J"]).decode()
-            data = json.loads(out)
-            for d in data.get('blockdevices', []):
-                if d['type'] in['loop', 'rom'] or d['name'].startswith('zram'): continue
-                model = d.get('model', 'Unknown Drive') or "Unknown Drive"
-                self.cmb_disk.addItem(f"{model} ({d['size']}) - /dev/{d['name']}", f"/dev/{d['name']}")
-                
-            # Load NTFS partitions for dual boot
-            out2 = subprocess.check_output(["lsblk", "-l", "-n", "-o", "NAME,SIZE,FSTYPE,TYPE", "-J"]).decode()
-            data2 = json.loads(out2)
-            for dev in data2.get('blockdevices',[]):
-                if dev['type'] == 'part' and str(dev.get('fstype')).lower() == 'ntfs':
-                    self.cmb_ntfs.addItem(f"/dev/{dev['name']} ({dev['size']})", f"/dev/{dev['name']}")
-        except Exception as e: 
-            self.cmb_disk.addItem(f"Error: {e}", None)
+            if not partition: return None
+            parent = subprocess.check_output(["lsblk", "-no", "pkname", partition], stderr=subprocess.PIPE
+            ).decode().strip()
+            return f"/dev/{parent}"
+        except Exception:
+            return None
 
-    def launch_cfdisk(self):
-        terms =["gparted", "konsole", "xterm", "gnome-terminal", "alacritty"]
-        term_cmd = None
-        for t in terms:
-            if shutil.which(t):
-                if t == "gparted": term_cmd = [t]
-                elif t == "konsole": term_cmd = [t, "--hide-menubar", "-e", "cfdisk"]
-                else: term_cmd = [t, "-e", "cfdisk"]
-                break
-        if term_cmd:
-            subprocess.run(term_cmd)
-            self.populate_partitions()
-
-    def populate_partitions(self):
-        self.cmb_root.clear()
-        self.cmb_boot.clear()
-        self.cmb_swap.clear()
-        self.cmb_swap.addItem("None", None)
+    def run(self):
         try:
-            cmd =["lsblk", "-l", "-n", "-o", "NAME,SIZE,FSTYPE,TYPE", "-J"]
-            out = subprocess.check_output(cmd).decode()
-            data = json.loads(out)
-            for dev in data.get('blockdevices', []):
-                if dev['type'] == 'part':
-                    fstype = dev.get('fstype') or "Unformatted"
-                    txt = f"/dev/{dev['name']} ({dev['size']}) - {fstype}"
-                    val = f"/dev/{dev['name']}"
-                    self.cmb_root.addItem(txt, val)
-                    self.cmb_boot.addItem(txt, val)
-                    self.cmb_swap.addItem(txt, val)
-        except Exception: pass
+            self.welcome()
+            self.safety_check()
+            self.partition_handler()
+            self.install_base()
+            if not shutil.which("arch-chroot"):
+                self.setup_chroot_mounts()
+            self.configure_system()
+            self.setup_users()
+            self.install_packages()
+            self.install_bootloader()
+            self.run_custom_scripts()
+            self.finalize()
+            log("AnOS Installation Successfully Completed.", "success")
+        except Exception as e:
+            log(f"Critical Failure: {e}", "error")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            self.cleanup()
 
-    def get_cmd_list(self):
-        cmd = ["python3", "-u", BACKEND_SCRIPT, "--target", "anos"]
-        d = self.install_data
+    def welcome(self):
+        os.system("clear")
+        log(f"AnOS Installer - The Simple & Powerful OS", "HEADER")
+        log(f"Network Status: {'Online' if self.is_online else 'Offline (Fallback Mode)'}", "info")
+        log(f"Profiles Selected: {self.args.profiles}", "info")
+        log(f"Target Disk: {self.disk} | Boot Mode: {'UEFI' if self.uefi else 'BIOS'}", "info")
 
-        # Disk Configuration
-        if d['method'] == 'whole':
-            if d['disk']: cmd.extend(["--disk", d['disk']])
-        elif d['method'] == 'dual':
-            if d['shrink_part']:
-                cmd.extend(["--shrink-part", d['shrink_part']])
-                cmd.extend(["--anos-size", str(d['anos_size'])])
+        if self.args.disk:
+            log("Disk Mode: WIPE WHOLE DISK", "warn")
+        elif self.args.shrink_part:
+            log(f"Disk Mode: DUAL BOOT (Shrink {self.args.shrink_part} by {self.args.anos_size}GB)", "warn")
         else:
-            if d['root']: cmd.extend(["--rootfs", d['root']])
-            if d['boot']: cmd.extend(["--boot", d['boot']])
-            if d['swap']: cmd.extend(["--swap", d['swap']])
+            log("Disk Mode: MANUAL PARTITIONING", "warn")
 
-        # Profiles & Packages
-        profiles = ",".join(d['profiles'])
-        cmd.extend(["--profiles", profiles])
-        if d['packages']:
-            pkgs = ",".join(d['packages'])
-            cmd.extend(["--packages", pkgs])
+        time.sleep(2)
 
-        # Users & System
-        cmd.extend(["--user", d['user']])
-        cmd.extend(["--passwd", d['pass']])
-        cmd.extend(["--host", d['host']])
-        cmd.extend(["--timezone", d['tz']])
-        
-        # We don't need --online flag in AnOS because logic auto detects in backend,
-        # but you can add it if needed. AnOS treemap relies on check_connection in chimera.py.
-        cmd.append("--i-am-very-stupid")
-        cmd.append("--debug")
-        return cmd
+    def safety_check(self):
+        if self.args.i_am_very_stupid: return
 
-    def open_debug_settings(self):
-        dlg = DebugDialog(self, " ".join(self.get_cmd_list()), self.dry_run)
-        if dlg.exec():
-            self.dry_run = dlg.chk_dry_run.isChecked()
+        if self.args.disk:
+            print(f"\n{COLORS['FAIL']}!!!!!!!!!! CẢNH BÁO ĐỎ !!!!!!!!!!{COLORS['ENDC']}")
+            print(f"{COLORS['FAIL']}TOÀN BỘ DỮ LIỆU TRÊN Ổ {self.args.disk} SẼ BỊ XÓA SẠCH VÀ FORMAT.{COLORS['ENDC']}")
+        elif self.args.shrink_part:
+            print(f"\n{COLORS['FAIL']}CẢNH BÁO: DUAL BOOT MODE{COLORS['ENDC']}")
+            print(f"Sẽ thu nhỏ phân vùng Windows {self.args.shrink_part}. Vui lòng đảm bảo đã tắt BitLocker/Fast Startup.")
+        else:
+            print(f"\n{COLORS['FAIL']}CẢNH BÁO: MANUAL MODE{COLORS['ENDC']}")
 
-    def go_next(self):
-        idx = self.pages.currentIndex()
+        if input(f"\nGõ 'YES' để tiếp tục: ") != "YES":
+            sys.exit("Đã hủy bỏ (Aborted).")
 
-        # Page 1: Location & KB
-        if idx == 1:
-            self.install_data['tz'] = self.cmb_city.currentData()
-            self.install_data['keyboard'] = self.cmb_kbd.currentText()
+    def partition_handler(self):
+        log("Preparing Partitions...", "info")
+        run_cmd(["umount", "-R", MOUNT_POINT], check=False, ignore_error=True)
+        run_cmd(["swapoff", "-a"], check=False, ignore_error=True)
 
-        # Page 2: Profile & Packages
-        if idx == 2:
-            profs = ["minimal"]
-            if self.chk_office.isChecked(): profs.append("office")
-            if self.chk_gaming.isChecked(): profs.append("gaming")
-            if self.chk_dev.isChecked(): profs.append("dev")
-            self.install_data['profiles'] = profs
+        if self.args.disk:
+            self._auto_partition_disk()
+        elif self.args.shrink_part:
+            self._dual_boot_shrink()
 
-            pkgs =[]
-            for i in range(self.lst_packages.count()):
-                item = self.lst_packages.item(i)
-                if item.checkState() == Qt.Checked:
-                    pkgs.append(item.data(Qt.UserRole))
-            self.install_data['packages'] = pkgs
+        # Format & Mount Root
+        run_cmd(["mkfs.ext4", "-F", self.args.rootfs])
+        os.makedirs(MOUNT_POINT, exist_ok=True)
+        run_cmd(["mount", self.args.rootfs, MOUNT_POINT])
 
-        # Page 3: Setup Disk
-        if idx == 3:
-            if self.rad_whole.isChecked():
-                self.install_data['method'] = "whole"
-                self.install_data['disk'] = self.cmb_disk.currentData()
-                if not self.install_data['disk']: return QMessageBox.warning(self, "Error", "Hãy chọn ổ đĩa.")
-                self.pages.setCurrentIndex(5) # Skip Partitions
-                self.step_list.setCurrentRow(5)
-                self.update_nav()
-                return
-            elif self.rad_dual.isChecked():
-                self.install_data['method'] = "dual"
-                self.install_data['shrink_part'] = self.cmb_ntfs.currentData()
-                self.install_data['anos_size'] = self.spin_anos_size.value()
-                if not self.install_data['shrink_part']: return QMessageBox.warning(self, "Error", "Không tìm thấy phân vùng Windows (NTFS).")
-                self.pages.setCurrentIndex(5) # Skip Partitions
-                self.step_list.setCurrentRow(5)
-                self.update_nav()
-                return
+        # Format & Mount Boot (If not sharing Windows EFI)
+        if self.args.boot:
+            path = f"{MOUNT_POINT}/boot/efi" if self.uefi else f"{MOUNT_POINT}/boot"
+            os.makedirs(path, exist_ok=True)
+            # Không format vfat nếu đang tái sử dụng EFI của Windows, chỉ mount
+            if self.args.shrink_part and self.uefi:
+                log(f"Tái sử dụng EFI Partition: {self.args.boot}", "info")
             else:
-                self.install_data['method'] = "manual"
-                self.populate_partitions()
+                if self.uefi: run_cmd(["mkfs.vfat", "-F32", self.args.boot])
+                else: run_cmd(["mkfs.ext4", "-F", self.args.boot])
 
-        # Page 4: Partitions
-        if idx == 4:
-            r, b = self.cmb_root.currentData(), self.cmb_boot.currentData()
-            if not r or not b: return QMessageBox.warning(self, "Error", "Yêu cầu Mount Root (/) và Boot.")
-            self.install_data['root'] = r
-            self.install_data['boot'] = b
-            self.install_data['swap'] = self.cmb_swap.currentData()
+            run_cmd(["mount", self.args.boot, path])
 
-        # Page 5: Users
-        if idx == 5:
-            u, p = self.inp_user.text(), self.inp_pass.text()
-            if not u or not p: return QMessageBox.warning(self, "Error", "User và Password là bắt buộc.")
-            self.install_data['user'] = u
-            self.install_data['pass'] = p
-            self.install_data['host'] = self.inp_host.text()
-            self.generate_summary()
+        # Setup Swap
+        if self.args.swap:
+            run_cmd(["mkswap", self.args.swap])
+            run_cmd(["swapon", self.args.swap])
 
-        # Page 6: Summary -> Install
-        if idx == 6:
-            if not self.dry_run:
-                if QMessageBox.question(self, "Confirm", "Disk changes are permanent. Proceed?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
-            self.start_install()
-            return
+    def _auto_partition_disk(self):
+        log(f"Wiping and partitioning {self.args.disk}...", "warn")
+        label_type = "gpt" if self.uefi else "msdos"
+        run_cmd(["wipefs", "--all", self.disk])
+        run_cmd(["parted", "-s", self.disk, "mklabel", label_type])
 
-        if idx < self.pages.count() - 1:
-            self.pages.setCurrentIndex(idx + 1)
-            self.step_list.setCurrentRow(idx + 1)
+        boot_part_end = "513MiB"
+        run_cmd(["parted", "-s", self.disk, "mkpart", "primary", "1MiB", boot_part_end])
+        current_end = boot_part_end
 
-        self.update_nav()
+        # Logic: Swap = RAM / 2
+        ram_gb = get_ram_gb()
+        swap_gb = max(1, ram_gb // 2)
+        swap_end = f"{513 + (swap_gb * 1024)}MiB"
 
-    def go_back(self):
-        idx = self.pages.currentIndex()
-        if idx == 5 and self.install_data['method'] in ['whole', 'dual']:
-            self.pages.setCurrentIndex(3)
-            self.step_list.setCurrentRow(3)
-        elif idx > 0:
-            self.pages.setCurrentIndex(idx - 1)
-            self.step_list.setCurrentRow(idx - 1)
-        self.update_nav()
+        log(f"Tạo Swap Partition: {swap_gb}GB", "info")
+        run_cmd(["parted", "-s", self.disk, "mkpart", "primary", current_end, swap_end])
+        current_end = swap_end
 
-    def update_nav(self):
-        idx = self.pages.currentIndex()
-        if idx < self.step_list.count():
-             self.step_list.setCurrentRow(idx)
-             self.lbl_header.setText(self.step_list.item(idx).text())
+        # Rootfs uses remaining 100%
+        run_cmd(["parted", "-s", self.disk, "mkpart", "primary", current_end, "100%"])
 
-        self.btn_back.setVisible(idx > 0 and idx < 7)
-        self.btn_next.setVisible(idx < 7)
+        prefix = f"{self.disk}p" if self.disk.startswith("/dev/nvme") or self.disk.startswith("/dev/mmc") else f"{self.disk}"
 
-        if idx == 6:
-            self.btn_next.setText("Bắt đầu cài đặt")
+        self.args.boot = f"{prefix}1"
+        self.args.swap = f"{prefix}2"
+        self.args.rootfs = f"{prefix}3"
+
+        if self.uefi: run_cmd(["parted", "-s", self.disk, "set", "1", "esp", "on"])
+        else: run_cmd(["parted", "-s", self.disk, "set", "1", "boot", "on"])
+
+        run_cmd(["partprobe", self.disk])
+        time.sleep(2)
+        log(f"Layout Auto: Boot={self.args.boot}, Swap={self.args.swap}, Root={self.args.rootfs}", "success")
+
+    def _dual_boot_shrink(self):
+        """Logic Thu nhỏ ổ Windows và tạo không gian cho AnOS"""
+        log(f"Tiến hành Dual Boot Shrink trên {self.args.shrink_part}...", "warn")
+        disk = self._detect_disk(self.args.shrink_part)
+        anos_size_mb = int(self.args.anos_size) * 1024
+
+        # 1. Thu nhỏ NTFS File System
+        run_cmd(["ntfsfix", self.args.shrink_part], ignore_error=True)
+        log("Đang Resize NTFS... quá trình này có thể mất thời gian.", "info")
+        run_cmd(["ntfsresize", "-f", "-s", f"-{anos_size_mb}M", self.args.shrink_part], stream=True)
+
+        # 2. Resize Partition Boundary bằng parted
+        part_num = self.args.shrink_part.replace(disk, "").replace("p", "")
+        run_cmd(["parted", "-s", disk, "resizepart", part_num, f"-{anos_size_mb}MB"])
+
+        # 3. Tạo Swap (RAM / 2) và RootFS ở vùng trống (Free Space)
+        ram_gb = get_ram_gb()
+        swap_gb = max(1, ram_gb // 2)
+
+        run_cmd(["parted", "-s", disk, "mkpart", "primary", "linux-swap", f"-{anos_size_mb}MB", f"-{anos_size_mb - swap_gb*1024}MB"])
+        run_cmd(["parted", "-s", disk, "mkpart", "primary", "ext4", f"-{anos_size_mb - swap_gb*1024}MB", "100%"])
+        run_cmd(["partprobe", disk])
+        time.sleep(2)
+
+        out = subprocess.check_output(["lsblk", "-lnP", "-o", "NAME", disk]).decode().strip().split('\n')
+        parts = [f"/dev/{line.split('=\"')[1].replace('\"','')}" for line in out]
+        self.args.swap = parts[-2]
+        self.args.rootfs = parts[-1]
+
+        # Tìm phân vùng EFI của Windows để xài ké
+        if self.uefi:
+            try:
+                efi_part = subprocess.check_output("lsblk -o NAME,PARTTYPE -J", shell=True).decode()
+                self.args.boot = subprocess.check_output(
+                    f"fdisk -l {disk} | grep EFI | awk '{{print $1}}'", shell=True
+                ).decode().strip()
+            except Exception:
+                log("Không tìm thấy EFI tự động, vui lòng cẩn thận.", "warn")
+
+        log(f"Layout Dual Boot: Boot(Shared)={self.args.boot}, Swap={self.args.swap}, Root={self.args.rootfs}", "success")
+
+    def install_base(self):
+        log(f"Cài đặt Base System AnOS (Clone via Rsync)...", "info")
+        excludes =[
+            "--exclude=/proc/*", "--exclude=/sys/*", "--exclude=/dev/*",
+            "--exclude=/run/*", "--exclude=/tmp/*", "--exclude=/mnt/*",
+            f"--exclude={MOUNT_POINT}/*"
+        ]
+        subprocess.run(["rsync", "-axHAWXS", "--numeric-ids", "--info=progress2"] + excludes + ["/", MOUNT_POINT],
+            check=True
+        )
+
+    def setup_chroot_mounts(self):
+        log("Mounting API filesystems...", "info")
+        for m in ["dev", "proc", "sys"]:
+            target = os.path.join(MOUNT_POINT, m)
+            os.makedirs(target, exist_ok=True)
+            run_cmd(["mount", "--rbind", f"/{m}", target], ignore_error=True)
+            run_cmd(["mount", "--make-rslave", target], ignore_error=True)
+        shutil.copy("/etc/resolv.conf", f"{MOUNT_POINT}/etc/resolv.conf")
+
+    def configure_system(self):
+        log("Configuring System...", "info")
+
+        hostname = self.args.host if hasattr(self.args, 'host') and self.args.host else 'AnOS'
+        log(f"Setting hostname to '{hostname}'...", "info")
+        with open(f"{MOUNT_POINT}/etc/hostname", "w") as f:
+            f.write(f"{hostname}\n")
+
+        # Timezone
+        tz = self.args.timezone if self.args.timezone else "Asia/Ho_Chi_Minh"
+        tz_path = f"/usr/share/zoneinfo/{tz}"
+        if os.path.exists(f"{MOUNT_POINT}{tz_path}"):
+            log(f"Setting timezone to {tz}...", "info")
+            run_cmd(f"ln -sf {tz_path} /etc/localtime", chroot=True)
+            run_cmd("hwclock --systohc", chroot=True, ignore_error=True)
+
+        # Keyboard & Locale
+        run_cmd("echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen", chroot=True)
+        run_cmd("locale-gen", chroot=True, ignore_error=True)
+        run_cmd("echo 'LANG=en_US.UTF-8' > /etc/locale.conf", chroot=True)
+        run_cmd("echo 'KEYMAP=us' > /etc/vconsole.conf", chroot=True)
+
+        # Enable Network
+        run_cmd("systemctl enable NetworkManager", chroot=True, ignore_error=True)
+
+        # --- Kernel Setup ---
+        log("Extracting Kernel and building initramfs...", "info")
+        kernel_dst = f"{MOUNT_POINT}/boot/vmlinuz-linux"
+        os.makedirs(os.path.dirname(kernel_dst), exist_ok=True)
+
+        search_patterns =[
+            "/usr/lib/modules/*/vmlinuz",
+            "/boot/vmlinuz-linux",
+            "/run/archiso/bootmnt/arch/boot/x86_64/vmlinuz-linux"
+        ]
+        kernel_src = next((glob.glob(p)[0] for p in search_patterns if glob.glob(p)), None)
+
+        if kernel_src:
+            log(f"Found kernel at: {kernel_src}", "info")
+            shutil.copy(kernel_src, kernel_dst)
+            os.chmod(kernel_dst, 0o644)
         else:
-            self.btn_next.setText("Next")
+            log("WARNING: No kernel image found. Skipping kernel copy — mkinitcpio may fail.", "warn")
 
-    def generate_summary(self):
-        d = self.install_data
-        html = f"""
-        <h3>System Configuration</h3>
-        <b>Hostname:</b> {d['host']}<br><b>User:</b> {d['user']}<br>
-        <b>Timezone:</b> {d['tz']} (KB: {d['keyboard']})<br>
-        <b>Profiles:</b> {", ".join(d['profiles']).upper()}<br>
-        <b>Packages To Install:</b> {len(d['packages'])} gói<br>
-        <h3>Storage Configuration</h3>
-        """
-        if d['method'] == 'whole': 
-            html += f"<b>Mode:</b> Erase Whole Disk<br><b>Target:</b> {d['disk']}<br><b>Swap:</b> Tự động (RAM/2)"
-        elif d['method'] == 'dual':
-            html += f"<b>Mode:</b> Dual Boot (Shrink Windows)<br><b>Shrink Target:</b> {d['shrink_part']}<br><b>AnOS Size:</b> {d['anos_size']} GB"
-        else: 
-            html += f"<b>Mode:</b> Manual Partitioning<br><b>Root:</b> {d['root']}<br><b>Boot:</b> {d['boot']}<br><b>Swap:</b> {d['swap']}"
-        self.txt_sum.setHtml(html)
+        # Xóa preset Archiso rác
+        run_cmd(
+            "rm -f /etc/mkinitcpio.conf.d/archiso.conf /etc/mkinitcpio.d/linux.preset",
+            chroot=True, ignore_error=True
+        )
 
-    def start_install(self):
-        self.pages.setCurrentIndex(7)
-        self.step_list.setCurrentRow(7)
-        self.update_nav()
-        cmd = self.get_cmd_list()
+        # Sửa cấu hình hook cơ bản — xóa hook archiso
+        conf_path = f"{MOUNT_POINT}/etc/mkinitcpio.conf"
+        try:
+            with open(conf_path, 'r') as f:
+                config_data = f.read()
+            if "archiso" in config_data:
+                log("Removing archiso hooks from mkinitcpio.conf...", "info")
+                config_data = config_data.replace("archiso", "block filesystems fsck")
+                with open(conf_path, 'w') as f:
+                    f.write(config_data)
+        except Exception as e:
+            log(f"Could not patch mkinitcpio.conf: {e}", "warn")
 
-        if self.dry_run:
-            self.txt_log.append("--- DRY RUN MODE ---")
-            self.txt_log.append(f"Command:\n{' '.join(cmd)}")
-            self.pbar.setValue(100)
-            self.lbl_progress.setText("Dry Run Complete")
-            return
-
-        self.process = QProcess()
-        self.process.setProcessChannelMode(QProcess.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self.read_output)
-        self.process.finished.connect(self.install_finished)
-        self.process.start(cmd[0], cmd[1:])
-        self.pbar.setRange(0, 0)
-
-    def read_output(self):
-        data = self.process.readAllStandardOutput().data().decode()
-        self.txt_log.moveCursor(QTextCursor.End)
-        self.txt_log.insertPlainText(data)
-        self.txt_log.moveCursor(QTextCursor.End)
-        lower = data.lower()
-        if "partitioning" in lower or "wiping" in lower or "shrink" in lower: self.lbl_progress.setText("Partitioning Disk...")
-        if "rsync" in lower or "clone" in lower: self.lbl_progress.setText("Copying Base System (AnOS)...")
-        if "pacman" in lower or "packages" in lower: self.lbl_progress.setText("Installing Profiles & Packages...")
-        if "nvidia" in lower: self.lbl_progress.setText("Setting up NVIDIA Mainline Driver...")
-        if "bootloader" in lower or "grub" in lower: self.lbl_progress.setText("Installing Bootloader...")
-
-    def install_finished(self):
-        if self.process.exitCode() == 0:
-            self.pbar.setRange(0, 100)
-            self.pbar.setValue(100)
-            self.lbl_progress.setText("Installation Successful!")
-            QMessageBox.information(self, "Hoàn tất", "AnOS đã được cài đặt thành công! Vui lòng khởi động lại.")
+        # *** FIX: Run mkinitcpio with ignore_error=True ***
+        if kernel_src:
+            log("Running mkinitcpio -P...", "info")
+            success = run_cmd("mkinitcpio -P", chroot=True, stream=True, ignore_error=True, check=False)
+            if not success:
+                log("mkinitcpio -P failed — initramfs may need to be regenerated on first boot.", "warn")
         else:
-            self.pbar.setRange(0, 100)
-            self.pbar.setValue(0)
-            self.lbl_progress.setText("Installation Failed")
-            QMessageBox.critical(self, "Lỗi", "Quá trình cài đặt thất bại. Vui lòng kiểm tra log.")
+            log("Skipping mkinitcpio -P (no kernel found). Run manually after install.", "warn")
+
+        # GHI LẠI FILE /etc/installation-type ĐỂ WELCOME APP BIẾT
+        log("Ghi nhận thông tin Installation Type...", "info")
+        with open(f"{MOUNT_POINT}/etc/installation-type", "w") as f:
+            f.write(f"ONLINE={self.is_online}\n")
+            f.write(f"PROFILES={self.args.profiles}\n")
+
+        # Sinh file fstab
+        self._gen_fstab()
+
+    def setup_users(self):
+        pwd = self.args.passwd
+        if pwd:
+            log("Setting ROOT password...", "info")
+            run_cmd(f"echo 'root:{pwd}' | chpasswd", chroot=True)
+
+        if self.args.user:
+            user = self.args.user
+            log(f"Creating user '{user}'...", "info")
+            run_cmd(f"useradd -m -G wheel -s /bin/bash {user}", chroot=True, ignore_error=True)
+            if pwd:
+                run_cmd(f"echo '{user}:{pwd}' | chpasswd", chroot=True)
+
+            log("Configuring sudo access...", "info")
+            run_cmd(
+                "sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers",
+                chroot=True, ignore_error=True
+            )
+
+    def install_packages(self):
+        """Xử lý cài đặt packages online theo profile và giải quyết NVIDIA Final Boss"""
+        if self.is_online and self.args.packages:
+            log("Online Mode: Khởi tạo Pacman Keyring & Cài đặt phần mềm theo Profile...", "HEADER")
+            run_cmd("pacman-key --init", chroot=True, ignore_error=True)
+            run_cmd("pacman-key --populate", chroot=True, ignore_error=True)
+            run_cmd("pacman -Sy", chroot=True, ignore_error=True)
+
+            pkgs = self.args.packages.replace(',', ' ')
+            log(f"Đang cài đặt các packages: {pkgs}", "info")
+            run_cmd(f"pacman -S --noconfirm {pkgs}", chroot=True, stream=True)
+        else:
+            log("Offline Mode hoặc Không có packages. Việc cài đặt Profile sẽ được Welcome App đảm nhận sau.", "warn")
+
+        # --- NVIDIA FINAL BOSS ---
+        log("Kiểm tra GPU NVIDIA...", "info")
+        if detect_nvidia():
+            log(">>> PHÁT HIỆN CARD NVIDIA. Kích hoạt Mainline Driver... <<<", "HEADER")
+            if self.is_online:
+                run_cmd("pacman -S --noconfirm nvidia nvidia-utils nvidia-settings", chroot=True, stream=True)
+            self.has_nvidia = True
+        else:
+            self.has_nvidia = False
+
+    def _gen_fstab(self):
+        if shutil.which("genfstab"):
+            with open(f"{MOUNT_POINT}/etc/fstab", "w") as f:
+                subprocess.run(["genfstab", "-U", MOUNT_POINT], stdout=f)
+        else:
+            log("Generating fstab manually...", "info")
+            root_uuid = get_blk_value(self.args.rootfs, 'UUID')
+            with open(f"{MOUNT_POINT}/etc/fstab", "w") as f:
+                f.write(f"UUID={root_uuid} / ext4 defaults 0 1\n")
+                if self.args.boot:
+                    boot_uuid = get_blk_value(self.args.boot, 'UUID')
+                    fs_type = "vfat" if self.uefi else "ext4"
+                    mount = '/boot/efi' if self.uefi else '/boot'
+                    f.write(f"UUID={boot_uuid} {mount} {fs_type} defaults 0 2\n")
+
+    def install_bootloader(self):
+        log("Installing Bootloader (GRUB)...", "info")
+
+        grub_path = f"{MOUNT_POINT}/etc/default/grub"
+        if os.path.exists(grub_path):
+            try:
+                with open(grub_path, 'r') as f:
+                    lines = f.readlines()
+                with open(grub_path, 'w') as f:
+                    for line in lines:
+                        if line.strip().startswith("GRUB_DISTRIBUTOR="):
+                            f.write("GRUB_DISTRIBUTOR='AnOS'\n")
+                        elif line.strip().startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+                            new_line = line.replace("quiet", "").replace("  ", " ").strip()
+                            if new_line.endswith('"'):
+                                new_line = new_line[:-1]
+                            if self.has_nvidia:
+                                new_line += " nvidia_drm.modeset=1 nouveau.modeset=0\""
+                            else:
+                                new_line += " quiet\""
+                            f.write(new_line + "\n")
+                        else:
+                            f.write(line)
+            except Exception as e:
+                log(f"Failed to edit grub config: {e}", "warn")
+
+        target = "x86_64-efi" if self.uefi else "i386-pc"
+        boot_id = "AnOS"
+
+        cmd =["grub-install", f"--target={target}", f"--bootloader-id={boot_id}", "--recheck"]
+        if self.uefi:
+            cmd.append("--efi-directory=/boot/efi")
+        else:
+            cmd.append(self.disk)
+
+        run_cmd(cmd, chroot=True, stream=True)
+        run_cmd("grub-mkconfig -o /boot/grub/grub.cfg", chroot=True, stream=True)
+
+    def run_custom_scripts(self):
+        if not self.args.run: return
+        log(f"Running Post-Install Command: {self.args.run}", "warn")
+        run_cmd(self.args.run, chroot=True, stream=True)
+
+    def finalize(self):
+        run_cmd("systemd-machine-id-setup", chroot=True, ignore_error=True)
+
+    def cleanup(self):
+        log("Cleaning up mounts...", "info")
+        run_cmd(["umount", "-R", MOUNT_POINT], check=False, ignore_error=True)
+
+# --- Entry Point ---
+def main():
+    parser = argparse.ArgumentParser()
+
+    # Disk Setup Arguments
+    parser.add_argument("--disk", help="Full Disk Wipe Mode (e.g., /dev/sda)")
+    parser.add_argument("--shrink-part", help="Dual Boot: Partition Windows muốn cắt (e.g., /dev/nvme0n1p3)")
+    parser.add_argument("--anos-size", help="Dual Boot: Dung lượng (GB) lấy ra để cài AnOS")
+    parser.add_argument("--boot", help="Manual: Boot partition")
+    parser.add_argument("--rootfs", help="Manual: Root partition")
+    parser.add_argument("--swap", help="Manual: Swap partition")
+
+    # AnOS Configuration Arguments
+    parser.add_argument("--target", default="anos", choices=["anos"])
+    parser.add_argument("--profiles", default="minimal", help="Comma-separated profiles: minimal,office,gaming,dev")
+    parser.add_argument("--packages", help="Comma-separated list các packages để cài đặt lúc chroot (truyền từ GUI)")
+
+    # User & System
+    parser.add_argument("--user", help="Create a new user")
+    parser.add_argument("--passwd", help="Password for the new user AND root")
+    parser.add_argument("--host", default="AnOS", help="Computer Name (Hostname)")
+    parser.add_argument("--timezone", default="Asia/Ho_Chi_Minh", help="Set Timezone (e.g. Asia/Ho_Chi_Minh)")
+
+    parser.add_argument("--run", help="Custom command to run inside chroot after install")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose output")
+    parser.add_argument("--i-am-very-stupid", action="store_true", help="Bypass safety warning prompt")
+
+    args = parser.parse_args()
+
+    global DEBUG_MODE
+    DEBUG_MODE = args.debug
+
+    if os.geteuid() != 0:
+        sys.exit("Run as root.")
+
+    if not args.disk and not args.shrink_part and not (args.boot and args.rootfs):
+        sys.exit("Error: Phải chỉ định `--disk` HOẶC (`--shrink-part` + `--anos-size`) HOẶC (`--boot` + `--rootfs`)")
+
+    if args.shrink_part and not args.anos_size:
+        sys.exit("Error: Chế độ Dual Boot cần cung cấp `--anos-size` (GB)")
+
+    AnOSInstaller(args).run()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = InstallerWindow()
-    win.show()
-    sys.exit(app.exec())
+    main()
