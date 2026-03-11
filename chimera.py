@@ -38,9 +38,9 @@ def run_cmd(cmd, shell=False, check=True, chroot=False, ignore_error=False, env=
         else: cmd_str = cmd
 
         if shutil.which("arch-chroot"):
-            cmd = ["arch-chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
+            cmd =["arch-chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
         else:
-            cmd = ["chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
+            cmd =["chroot", MOUNT_POINT, "/bin/sh", "-c", cmd_str]
         shell = False
 
     if DEBUG_MODE:
@@ -112,8 +112,7 @@ class AnOSInstaller:
     def _detect_disk(self, partition):
         try:
             if not partition: return None
-            parent = subprocess.check_output(
-                ["lsblk", "-no", "pkname", partition], stderr=subprocess.PIPE
+            parent = subprocess.check_output(["lsblk", "-no", "pkname", partition], stderr=subprocess.PIPE
             ).decode().strip()
             return f"/dev/{parent}"
         except Exception:
@@ -284,13 +283,12 @@ class AnOSInstaller:
 
     def install_base(self):
         log(f"Cài đặt Base System AnOS (Clone via Rsync)...", "info")
-        excludes = [
+        excludes =[
             "--exclude=/proc/*", "--exclude=/sys/*", "--exclude=/dev/*",
             "--exclude=/run/*", "--exclude=/tmp/*", "--exclude=/mnt/*",
             f"--exclude={MOUNT_POINT}/*"
         ]
-        subprocess.run(
-            ["rsync", "-axHAWXS", "--numeric-ids", "--info=progress2"] + excludes + ["/", MOUNT_POINT],
+        subprocess.run(["rsync", "-axHAWXS", "--numeric-ids", "--info=progress2"] + excludes + ["/", MOUNT_POINT],
             check=True
         )
 
@@ -333,7 +331,7 @@ class AnOSInstaller:
         kernel_dst = f"{MOUNT_POINT}/boot/vmlinuz-linux"
         os.makedirs(os.path.dirname(kernel_dst), exist_ok=True)
 
-        search_patterns = [
+        search_patterns =[
             "/usr/lib/modules/*/vmlinuz",
             "/boot/vmlinuz-linux",
             "/run/archiso/bootmnt/arch/boot/x86_64/vmlinuz-linux"
@@ -367,9 +365,6 @@ class AnOSInstaller:
             log(f"Could not patch mkinitcpio.conf: {e}", "warn")
 
         # *** FIX: Run mkinitcpio with ignore_error=True ***
-        # mkinitcpio can fail if the chroot environment is not fully set up
-        # (e.g., missing kernel modules directory). This is non-fatal —
-        # the Welcome App / first-boot setup can regenerate initramfs.
         if kernel_src:
             log("Running mkinitcpio -P...", "info")
             success = run_cmd("mkinitcpio -P", chroot=True, stream=True, ignore_error=True, check=False)
@@ -474,7 +469,7 @@ class AnOSInstaller:
         target = "x86_64-efi" if self.uefi else "i386-pc"
         boot_id = "AnOS"
 
-        cmd = ["grub-install", f"--target={target}", f"--bootloader-id={boot_id}", "--recheck"]
+        cmd =["grub-install", f"--target={target}", f"--bootloader-id={boot_id}", "--recheck"]
         if self.uefi:
             cmd.append("--efi-directory=/boot/efi")
         else:
