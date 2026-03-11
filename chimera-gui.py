@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QRadioButton, QComboBox, QLineEdit, QCheckBox,
                                QFrame, QListWidget, QListWidgetItem, QMessageBox,
                                QTextEdit, QProgressBar, QSpinBox, QGroupBox,
-                               QDialog, QToolButton)
-from PySide6.QtCore import Qt, QProcess, QTimer
+                               QDialog, QToolButton, QGraphicsOpacityEffect)
+from PySide6.QtCore import Qt, QProcess, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QPixmap, QIcon, QFont, QTextCursor
 
 # --- Configuration & Constants ---
@@ -23,19 +23,15 @@ ZONEINFO_PATH = "/usr/share/zoneinfo"
 
 # Danh sách Packages theo Profile
 PKG_MAP = {
-    # Minimal / Base (Luôn có)
     "google-chrome": "minimal",
     "sudo-gui": "minimal",
     "freetube-bin": "minimal",
     "harmonymusic": "minimal",
-    # Office
     "libreoffice-fresh": "office",
-    # Gaming
     "wine": "gaming",
     "gamemode": "gaming",
     "mangohud": "gaming",
     "steam": "gaming",
-    # Dev
     "neovim": "dev",
     "vim": "dev",
     "python": "dev",
@@ -93,9 +89,43 @@ class DebugDialog(QDialog):
         self.txt_cmd.setReadOnly(True)
         layout.addWidget(self.txt_cmd)
         
+        # FIX: Căn lề nút Apply & Close
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
         btn_close = QPushButton("Apply & Close")
         btn_close.clicked.connect(self.accept)
-        layout.addWidget(btn_close)
+        btn_layout.addWidget(btn_close)
+        
+        layout.addLayout(btn_layout)
+
+class PackageEditDialog(QDialog):
+    def __init__(self, profile_name, current_pkgs, all_pkgs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Chỉnh sửa Packages: {profile_name.capitalize()}")
+        self.resize(350, 400)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel(f"<b>Packages thuộc nhóm {profile_name.capitalize()}:</b>"))
+        self.list_widget = QListWidget()
+        self.items = {}
+        for pkg in all_pkgs:
+            item = QListWidgetItem(pkg)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if pkg in current_pkgs else Qt.Unchecked)
+            self.list_widget.addItem(item)
+            self.items[pkg] = item
+            
+        layout.addWidget(self.list_widget)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_save = QPushButton("Lưu")
+        btn_save.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_save)
+        layout.addLayout(btn_layout)
+        
+    def get_selected(self):
+        return[pkg for pkg, item in self.items.items() if item.checkState() == Qt.Checked]
 
 # --- Main Window ---
 class InstallerWindow(QMainWindow):
@@ -103,7 +133,7 @@ class InstallerWindow(QMainWindow):
         super().__init__()
 
         self.os_info = get_os_release()
-        self.distro_name = "AnOS"
+        self.distro_name = self.os_info.get("NAME", "AnOS")
         self.setWindowTitle(f"{self.distro_name} Installer")
         self.resize(1000, 700)
 
@@ -117,6 +147,13 @@ class InstallerWindow(QMainWindow):
             "user": "", "pass": "", "host": "anos-pc", "tz": "Asia/Ho_Chi_Minh",
             "keyboard": "us", "profiles": ["minimal"], "packages":[]
         }
+        
+        # Tổ chức Packages
+        self.profile_all_pkgs = {"minimal":[], "office": [], "gaming": [], "dev":[]}
+        for pkg, prof in PKG_MAP.items():
+            if prof in self.profile_all_pkgs:
+                self.profile_all_pkgs[prof].append(pkg)
+        self.profile_selected_pkgs = {k: v.copy() for k, v in self.profile_all_pkgs.items()}
 
         self.setup_ui()
         self.check_root()
@@ -153,8 +190,18 @@ class InstallerWindow(QMainWindow):
         lbl_logo.setAlignment(Qt.AlignCenter)
         lbl_logo.setFixedHeight(140)
 
-        if os.path.exists(LOCAL_LOGO_PATH):
-            pix = QPixmap(LOCAL_LOGO_PATH).scaled(110, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # FIX: Detect Logo qua os-release
+        logo_val = self.os_info.get("LOGO", "anos")
+        if logo_val.startswith("/"):
+            logo_path = logo_val
+        else:
+            logo_path = f"/usr/share/pixmaps/{logo_val}.png"
+            
+        if not os.path.exists(logo_path):
+            logo_path = LOCAL_LOGO_PATH
+
+        if os.path.exists(logo_path):
+            pix = QPixmap(logo_path).scaled(110, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             lbl_logo.setPixmap(pix)
         else:
             lbl_logo.setText(self.distro_name)
@@ -199,6 +246,15 @@ class InstallerWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         content_layout.addWidget(self.pages)
+        
+        # Thêm Animation mượt mà cho Content
+        self.opacity_effect = QGraphicsOpacityEffect(self.pages)
+        self.pages.setGraphicsEffect(self.opacity_effect)
+        self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.anim.setDuration(300)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setEasingCurve(QEasingCurve.InOutQuad)
 
         nav_layout = QHBoxLayout()
         nav_layout.setContentsMargins(0, 20, 0, 0)
@@ -268,40 +324,35 @@ class InstallerWindow(QMainWindow):
         # 2. Profile Selection
         p_prof = QWidget()
         vbox = QVBoxLayout(p_prof)
-        vbox.addWidget(QLabel("<b>Chọn Profile (Mục đích sử dụng):</b>\n*Minimal mặc định luôn được chọn."))
+        vbox.addWidget(QLabel("<b>Chọn Profile (Mục đích sử dụng):</b>\n*Bấm vào cây bút ✏️ bên phải để chỉnh sửa Packages chi tiết."))
         
-        hbox = QHBoxLayout()
-        self.chk_office = QCheckBox("Office (Văn phòng)")
-        self.chk_gaming = QCheckBox("Gaming (Chơi game)")
-        self.chk_dev = QCheckBox("Dev (Lập trình)")
-        
-        self.chk_office.toggled.connect(self.update_package_list)
-        self.chk_gaming.toggled.connect(self.update_package_list)
-        self.chk_dev.toggled.connect(self.update_package_list)
-
-        hbox.addWidget(self.chk_office)
-        hbox.addWidget(self.chk_gaming)
-        hbox.addWidget(self.chk_dev)
-        vbox.addLayout(hbox)
-
-        vbox.addWidget(QLabel("<b>Tùy chỉnh Packages:</b>"))
-        self.lst_packages = QListWidget()
-        for pkg, prof in PKG_MAP.items():
-            item = QListWidgetItem(f"{pkg} ({prof})")
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            # Default check minimal
-            if prof == "minimal":
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
-            item.setData(Qt.UserRole, pkg)
-            item.setData(Qt.UserRole + 1, prof)
-            self.lst_packages.addItem(item)
-
-        vbox.addWidget(self.lst_packages)
-        if not self.is_online:
-            vbox.addWidget(QLabel("<span style='color:red;'>*Offline: Các packages sẽ được ghi nhận và cài đặt sau bởi Welcome App khi có mạng.</span>"))
+        self.prof_checks = {}
+        # FIX: Tách các nhóm Profile thành hàng ngang kèm nút bút chì
+        for prof in["minimal", "office", "gaming", "dev"]:
+            row = QHBoxLayout()
+            chk = QCheckBox(f"{prof.capitalize()} (Phần mềm {prof})")
             
+            if prof == "minimal":
+                chk.setChecked(True)
+                chk.setEnabled(False) # Bắt buộc
+            
+            self.prof_checks[prof] = chk
+            
+            btn_edit = QToolButton()
+            btn_edit.setText("✏️")
+            btn_edit.setToolTip(f"Chỉnh sửa gói phần mềm {prof.capitalize()}")
+            btn_edit.setCursor(Qt.PointingHandCursor)
+            btn_edit.clicked.connect(lambda checked, p=prof: self.edit_profile_packages(p))
+            
+            row.addWidget(chk)
+            row.addStretch()
+            row.addWidget(btn_edit)
+            vbox.addLayout(row)
+
+        if not self.is_online:
+            vbox.addWidget(QLabel("<br><span style='color:red;'>*Offline: Các packages sẽ được ghi nhận và cài đặt sau bởi Welcome App khi có mạng.</span>"))
+            
+        vbox.addStretch()
         self.pages.addWidget(p_prof)
 
         # 3. Disk Setup
@@ -431,23 +482,14 @@ class InstallerWindow(QMainWindow):
         vbox.addStretch()
         self.pages.addWidget(p_inst)
 
+    def edit_profile_packages(self, prof):
+        dlg = PackageEditDialog(prof, self.profile_selected_pkgs[prof], self.profile_all_pkgs[prof], self)
+        if dlg.exec():
+            self.profile_selected_pkgs[prof] = dlg.get_selected()
+
     def toggle_disk_ui(self):
         self.wid_whole.setVisible(self.rad_whole.isChecked())
         self.wid_dual.setVisible(self.rad_dual.isChecked())
-
-    def update_package_list(self):
-        active_profiles = ["minimal"]
-        if self.chk_office.isChecked(): active_profiles.append("office")
-        if self.chk_gaming.isChecked(): active_profiles.append("gaming")
-        if self.chk_dev.isChecked(): active_profiles.append("dev")
-
-        for i in range(self.lst_packages.count()):
-            item = self.lst_packages.item(i)
-            prof = item.data(Qt.UserRole + 1)
-            if prof in active_profiles:
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
 
     # --- Timezone Logic ---
     def populate_regions(self):
@@ -476,7 +518,6 @@ class InstallerWindow(QMainWindow):
         self.cmb_region.addItems(regions)
         self.cmb_region.blockSignals(False)
 
-        # Try to auto set Asia/Ho_Chi_Minh for AnOS default
         idx = self.cmb_region.findText("Asia")
         if idx >= 0:
             self.cmb_region.setCurrentIndex(idx)
@@ -512,15 +553,13 @@ class InstallerWindow(QMainWindow):
         self.cmb_disk.clear()
         self.cmb_ntfs.clear()
         try:
-            # Load full disks
             out = subprocess.check_output(["lsblk", "-d", "-n", "-o", "NAME,SIZE,MODEL,TYPE", "-J"]).decode()
             data = json.loads(out)
-            for d in data.get('blockdevices', []):
+            for d in data.get('blockdevices',[]):
                 if d['type'] in['loop', 'rom'] or d['name'].startswith('zram'): continue
                 model = d.get('model', 'Unknown Drive') or "Unknown Drive"
                 self.cmb_disk.addItem(f"{model} ({d['size']}) - /dev/{d['name']}", f"/dev/{d['name']}")
                 
-            # Load NTFS partitions for dual boot
             out2 = subprocess.check_output(["lsblk", "-l", "-n", "-o", "NAME,SIZE,FSTYPE,TYPE", "-J"]).decode()
             data2 = json.loads(out2)
             for dev in data2.get('blockdevices',[]):
@@ -535,8 +574,8 @@ class InstallerWindow(QMainWindow):
         for t in terms:
             if shutil.which(t):
                 if t == "gparted": term_cmd = [t]
-                elif t == "konsole": term_cmd = [t, "--hide-menubar", "-e", "cfdisk"]
-                else: term_cmd = [t, "-e", "cfdisk"]
+                elif t == "konsole": term_cmd =[t, "--hide-menubar", "-e", "cfdisk"]
+                else: term_cmd =[t, "-e", "cfdisk"]
                 break
         if term_cmd:
             subprocess.run(term_cmd)
@@ -561,11 +600,22 @@ class InstallerWindow(QMainWindow):
                     self.cmb_swap.addItem(txt, val)
         except Exception: pass
 
+    def get_post_install_commands(self):
+        """
+        Viết các lệnh cần chạy sau khi rsync + user create ở đây.
+        Các lệnh sẽ được tự động nối và truyền qua tham số `--run` của backend.
+        """
+        cmds =[
+            "systemctl enable sddm",
+            # Thêm các lệnh khác ở đây nếu cần thiết, ví dụ:
+            # "systemctl enable NetworkManager"
+        ]
+        return " && ".join(cmds)
+
     def get_cmd_list(self):
         cmd = ["python3", "-u", BACKEND_SCRIPT, "--target", "anos"]
         d = self.install_data
 
-        # Disk Configuration
         if d['method'] == 'whole':
             if d['disk']: cmd.extend(["--disk", d['disk']])
         elif d['method'] == 'dual':
@@ -577,21 +627,22 @@ class InstallerWindow(QMainWindow):
             if d['boot']: cmd.extend(["--boot", d['boot']])
             if d['swap']: cmd.extend(["--swap", d['swap']])
 
-        # Profiles & Packages
         profiles = ",".join(d['profiles'])
         cmd.extend(["--profiles", profiles])
         if d['packages']:
             pkgs = ",".join(d['packages'])
             cmd.extend(["--packages", pkgs])
 
-        # Users & System
         cmd.extend(["--user", d['user']])
         cmd.extend(["--passwd", d['pass']])
         cmd.extend(["--host", d['host']])
         cmd.extend(["--timezone", d['tz']])
         
-        # We don't need --online flag in AnOS because logic auto detects in backend,
-        # but you can add it if needed. AnOS treemap relies on check_connection in chimera.py.
+        # Thêm các lệnh Post-Install
+        post_cmd = self.get_post_install_commands()
+        if post_cmd:
+            cmd.extend(["--run", post_cmd])
+        
         cmd.append("--i-am-very-stupid")
         cmd.append("--debug")
         return cmd
@@ -604,33 +655,27 @@ class InstallerWindow(QMainWindow):
     def go_next(self):
         idx = self.pages.currentIndex()
 
-        # Page 1: Location & KB
         if idx == 1:
             self.install_data['tz'] = self.cmb_city.currentData()
             self.install_data['keyboard'] = self.cmb_kbd.currentText()
 
-        # Page 2: Profile & Packages
         if idx == 2:
-            profs = ["minimal"]
-            if self.chk_office.isChecked(): profs.append("office")
-            if self.chk_gaming.isChecked(): profs.append("gaming")
-            if self.chk_dev.isChecked(): profs.append("dev")
-            self.install_data['profiles'] = profs
-
+            profs =[]
             pkgs =[]
-            for i in range(self.lst_packages.count()):
-                item = self.lst_packages.item(i)
-                if item.checkState() == Qt.Checked:
-                    pkgs.append(item.data(Qt.UserRole))
+            for prof, chk in self.prof_checks.items():
+                if chk.isChecked():
+                    profs.append(prof)
+                    pkgs.extend(self.profile_selected_pkgs[prof])
+            
+            self.install_data['profiles'] = profs
             self.install_data['packages'] = pkgs
 
-        # Page 3: Setup Disk
         if idx == 3:
             if self.rad_whole.isChecked():
                 self.install_data['method'] = "whole"
                 self.install_data['disk'] = self.cmb_disk.currentData()
                 if not self.install_data['disk']: return QMessageBox.warning(self, "Error", "Hãy chọn ổ đĩa.")
-                self.pages.setCurrentIndex(5) # Skip Partitions
+                self.pages.setCurrentIndex(5) 
                 self.step_list.setCurrentRow(5)
                 self.update_nav()
                 return
@@ -639,7 +684,7 @@ class InstallerWindow(QMainWindow):
                 self.install_data['shrink_part'] = self.cmb_ntfs.currentData()
                 self.install_data['anos_size'] = self.spin_anos_size.value()
                 if not self.install_data['shrink_part']: return QMessageBox.warning(self, "Error", "Không tìm thấy phân vùng Windows (NTFS).")
-                self.pages.setCurrentIndex(5) # Skip Partitions
+                self.pages.setCurrentIndex(5) 
                 self.step_list.setCurrentRow(5)
                 self.update_nav()
                 return
@@ -647,7 +692,6 @@ class InstallerWindow(QMainWindow):
                 self.install_data['method'] = "manual"
                 self.populate_partitions()
 
-        # Page 4: Partitions
         if idx == 4:
             r, b = self.cmb_root.currentData(), self.cmb_boot.currentData()
             if not r or not b: return QMessageBox.warning(self, "Error", "Yêu cầu Mount Root (/) và Boot.")
@@ -655,7 +699,6 @@ class InstallerWindow(QMainWindow):
             self.install_data['boot'] = b
             self.install_data['swap'] = self.cmb_swap.currentData()
 
-        # Page 5: Users
         if idx == 5:
             u, p = self.inp_user.text(), self.inp_pass.text()
             if not u or not p: return QMessageBox.warning(self, "Error", "User và Password là bắt buộc.")
@@ -664,7 +707,6 @@ class InstallerWindow(QMainWindow):
             self.install_data['host'] = self.inp_host.text()
             self.generate_summary()
 
-        # Page 6: Summary -> Install
         if idx == 6:
             if not self.dry_run:
                 if QMessageBox.question(self, "Confirm", "Disk changes are permanent. Proceed?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
@@ -689,6 +731,10 @@ class InstallerWindow(QMainWindow):
 
     def update_nav(self):
         idx = self.pages.currentIndex()
+        
+        # Kích hoạt Animation Fade-in khi đổi trang
+        self.anim.start()
+
         if idx < self.step_list.count():
              self.step_list.setCurrentRow(idx)
              self.lbl_header.setText(self.step_list.item(idx).text())
